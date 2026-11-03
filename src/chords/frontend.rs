@@ -152,72 +152,78 @@ impl Frontend {
     /// `[frames, bins, CHANNELS]` for a stereo window (`[2][samples]`), `frames = ceil(samples / hop)`.
     pub fn forward(&self, wave: &[&[f32]; 2]) -> (Vec<f32>, usize) {
         let frames = wave[0].len().div_ceil(self.hop);
-        let (bins, harmonics, large) = (self.bins, self.harmonics, self.large);
+        let (bins, harmonics) = (self.bins, self.harmonics);
         let z: Cqt = wave.par_iter().map(|w| self.cqt(w, frames)).collect();
+        let actual = self.actual;
+        // the magnitudes `[channel][bin][frame]`
+        let mag: Vec<Vec<f32>> = z.iter().map(|z| z.par_iter().map(|v| v.norm()).collect()).collect();
+        // the harmonics, read off the magnitudes by interpolation, normalised over both channels:
+        // `[channel * harmonic][bin][frame]`
+        let mut spec = vec![0.0f32; 2 * harmonics * bins * frames];
+        spec.par_chunks_mut(frames).enumerate().for_each(|(i, row)| {
+            let (plane, b) = (i / bins, i % bins);
+            let (channel, h) = (plane / harmonics, plane % harmonics);
+            let (lo, hi, a) = (self.lower[h * bins + b], self.upper[h * bins + b], self.alpha[h * bins + b]);
+            debug_assert!(hi < self.large);
+            let zero = vec![0.0f32; frames];
+            let at = |b: usize| if b < actual { &mag[channel][b * frames..(b + 1) * frames] } else { &zero[..] };
+            for ((o, &l), &u) in row.iter_mut().zip(at(lo)).zip(at(hi)) {
+                *o = l + a * (u - l);
+            }
+        });
+        let spec_moments = moments(&spec);
+        // the onset saliency of each channel's fundamental: `[channel][bin][frame]`
+        let mut sal = vec![0.0f32; 2 * bins * frames];
+        sal.par_chunks_mut(frames).enumerate().for_each(|(i, out)| {
+            let (channel, b) = (i / bins, i % bins);
+            let row = &z[channel][b * frames..(b + 1) * frames];
+            for f in 1..frames {
+                let d = row[f] * row[f - 1].conj();
+                out[f] = d.im.atan2(d.re).abs() * mag[channel][b * frames + f];
+            }
+        });
+        let sal_moments = moments(&sal);
+        // the left-right cues: phase difference (sine, cosine) weighted by the energy, level difference
+        let count = (bins * frames) as f64;
+        let cross: Vec<Complex32> = z[0][..bins * frames].par_iter().zip(&z[1][..bins * frames]).map(|(l, r)| l * r.conj()).collect();
+        let energy: Vec<f32> = cross.par_iter().map(|c| c.norm()).collect();
+        let energy_mean = (energy.par_iter().map(|&e| e as f64).sum::<f64>() / count).max(1e-12);
+        let level_mean =
+            ((0..bins * frames).into_par_iter().map(|i| (mag[0][i] + mag[1][i]) as f64).sum::<f64>() / count).max(1e-12);
+        let floor = (1e-2 * level_mean) as f32;
+        // channels last, a block of frames per task
+        const FB: usize = 16;
         let c = Self::CHANNELS;
         let mut out = vec![0.0f32; frames * bins * c];
-        // the harmonics, read off the magnitudes by interpolation, normalised over both channels
-        let mut spec = vec![0.0f32; 2 * harmonics * bins * frames]; // [channel * harmonic][bin][frame]
-        spec.par_chunks_mut(bins * frames).enumerate().for_each(|(ch, plane)| {
-            let (channel, h) = (ch / harmonics, ch % harmonics);
-            let mag = |b: usize, f: usize| if b < self.actual { z[channel][b * frames + f].norm() } else { 0.0 };
+        out.par_chunks_mut(FB * bins * c).enumerate().for_each(|(block, out)| {
+            let f0 = block * FB;
+            let nf = out.len() / (bins * c);
             for b in 0..bins {
-                let (lo, hi, a) = (self.lower[h * bins + b], self.upper[h * bins + b], self.alpha[h * bins + b]);
-                debug_assert!(hi < large);
-                for f in 0..frames {
-                    let (l, u) = (mag(lo, f), mag(hi, f));
-                    plane[b * frames + f] = l + a * (u - l);
+                let i0 = b * frames + f0;
+                for (ch, plane) in spec.chunks(bins * frames).enumerate() {
+                    for (j, &v) in plane[i0..i0 + nf].iter().enumerate() {
+                        out[(j * bins + b) * c + ch] = ((v as f64 - spec_moments.0) / spec_moments.1) as f32;
+                    }
+                }
+                for (channel, plane) in sal.chunks(bins * frames).enumerate() {
+                    for (j, &v) in plane[i0..i0 + nf].iter().enumerate() {
+                        out[(j * bins + b) * c + 2 * harmonics + channel] = ((v as f64 - sal_moments.0) / sal_moments.1) as f32;
+                    }
+                }
+                for j in 0..nf {
+                    let i = i0 + j;
+                    let e = energy[i];
+                    let weight = ((e as f64 / energy_mean).ln_1p().min(4.0) / 4.0) as f32;
+                    let unit = cross[i] / e.max(1e-12);
+                    let (al, ar) = (mag[0][i], mag[1][i]);
+                    let ild = ((al + floor) / (ar + floor)).ln().clamp(-3.0, 3.0) / 3.0;
+                    let o = &mut out[(j * bins + b) * c + 2 * harmonics + 2..][..3];
+                    o[0] = unit.im * weight;
+                    o[1] = unit.re * weight;
+                    o[2] = if weight > 0.0 { ild } else { 0.0 };
                 }
             }
         });
-        let (mean, std) = moments(&spec);
-        for (ch, plane) in spec.chunks(bins * frames).enumerate() {
-            for b in 0..bins {
-                for f in 0..frames {
-                    out[(f * bins + b) * c + ch] = ((plane[b * frames + f] as f64 - mean) / std) as f32;
-                }
-            }
-        }
-        // the onset saliency of each channel's fundamental
-        let mut sal = vec![0.0f32; 2 * bins * frames];
-        for (channel, plane) in sal.chunks_mut(bins * frames).enumerate() {
-            for b in 0..bins {
-                let row = &z[channel][b * frames..(b + 1) * frames];
-                for f in 1..frames {
-                    let d = row[f] * row[f - 1].conj();
-                    plane[b * frames + f] = d.im.atan2(d.re).abs() * row[f].norm();
-                }
-            }
-        }
-        let (mean, std) = moments(&sal);
-        for (channel, plane) in sal.chunks(bins * frames).enumerate() {
-            for b in 0..bins {
-                for f in 0..frames {
-                    out[(f * bins + b) * c + 2 * harmonics + channel] = ((plane[b * frames + f] as f64 - mean) / std) as f32;
-                }
-            }
-        }
-        // the left-right cues: phase difference (sine, cosine) weighted by the energy, level difference
-        let count = (bins * frames) as f64;
-        let cross: Vec<Complex32> =
-            (0..bins * frames).map(|i| z[0][i] * z[1][i].conj()).collect();
-        let energy_mean = (cross.iter().map(|c| c.norm() as f64).sum::<f64>() / count).max(1e-12);
-        let level_mean = ((0..bins * frames).map(|i| (z[0][i].norm() + z[1][i].norm()) as f64).sum::<f64>() / count).max(1e-12);
-        let floor = (1e-2 * level_mean) as f32;
-        for b in 0..bins {
-            for f in 0..frames {
-                let i = b * frames + f;
-                let energy = cross[i].norm();
-                let weight = ((energy as f64 / energy_mean).ln_1p().min(4.0) / 4.0) as f32;
-                let unit = cross[i] / energy.max(1e-12);
-                let (al, ar) = (z[0][i].norm(), z[1][i].norm());
-                let ild = ((al + floor) / (ar + floor)).ln().clamp(-3.0, 3.0) / 3.0;
-                let o = &mut out[(f * bins + b) * c + 2 * harmonics + 2..][..3];
-                o[0] = unit.im * weight;
-                o[1] = unit.re * weight;
-                o[2] = if weight > 0.0 { ild } else { 0.0 };
-            }
-        }
         (out, frames)
     }
 }
