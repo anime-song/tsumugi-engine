@@ -2,8 +2,8 @@
 
     python rust/scripts/check_bars.py --weights cpu.safetensors [--model REPO_OR_FOLDER] LOGITS.heads.safetensors ...
 
-Each file (``sheetsage2-cpu --heads section,key --logits``: the beat, melody and chord heads' logits and the encoder
-states' block means) goes through ``sheetsage2-cpu --from-logits --heads section,key`` and through
+Each file (``tsumugi-engine --heads section,key --logits``: the beat, melody and chord heads' logits and the encoder
+states' block means) goes through ``tsumugi-engine --from-logits --heads section,key`` and through
 ``HeadSections.sections`` / ``HeadKeys.keys`` (the model folder's section and key models and decoding); the sections
 and keys must be equal.
 """

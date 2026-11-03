@@ -3,11 +3,11 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (wave, rate) = sheetsage2_cpu::audio::decode(std::path::Path::new(&args[1])).expect("decode");
+    let (wave, rate) = tsumugi_engine::audio::decode(std::path::Path::new(&args[1])).expect("decode");
     let wave = if args.iter().any(|a| a == "--no-resample") {
         wave
     } else {
-        sheetsage2_cpu::audio::resample(&wave, rate as usize, sheetsage2_cpu::encoder::SAMPLE_RATE)
+        tsumugi_engine::audio::resample(&wave, rate as usize, tsumugi_engine::encoder::SAMPLE_RATE)
     };
     let bytes: Vec<u8> = wave.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(&args[2], bytes).expect("write");

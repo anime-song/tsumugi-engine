@@ -1,4 +1,4 @@
-# sheetsage2-cpu (with Tsumugi-Chords)
+# tsumugi-engine
 
 SheetSage2's MERT-v2 encoder, SheetSage2-Refined's beat and melody heads and their trackers, its section and key
 models, and Tsumugi-Chords' chord model and decoder, on the CPU, in Rust, for machines without a GPU. One pass of the
@@ -13,7 +13,7 @@ pip install git+https://github.com/anime-song/SheetSage2-Refined git+https://git
 python -m sheetsage2_refined.export_cpu cpu.safetensors [--dtype f16|f32|i8] [--lora ADAPTER --lora-scale S]
 python python/export_chords.py chords.safetensors          # Tsumugi-Chords (anime-song/Tsumugi-Chords)
 cargo build --release
-./target/release/sheetsage2-cpu --weights cpu.safetensors [--chords chords.safetensors] [--adapter LORA] \
+./target/release/tsumugi-engine --weights cpu.safetensors [--chords chords.safetensors] [--adapter LORA] \
     [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--tempo-weight W] [--logits] song.mp3 ...
 ```
 
@@ -39,7 +39,7 @@ then reads it resampled, in both channels).
 
 ```bash
 python -m sheetsage2_refined.export_cpu my.lora.safetensors --adapter LORA.safetensors [--lora-scale S]
-./target/release/sheetsage2-cpu --weights cpu.safetensors --adapter my.lora.safetensors song.mp3
+./target/release/tsumugi-engine --weights cpu.safetensors --adapter my.lora.safetensors song.mp3
 ```
 
 `--adapter` (in `export_cpu`) writes only the adapter, folded the way the weights it changes are: `A` with the
@@ -60,7 +60,7 @@ up to 1.6e-2).
 
 ```bash
 cargo build --release --features gpu
-./target/release/sheetsage2-cpu --device gpu --weights cpu.safetensors song.mp3
+./target/release/tsumugi-engine --device gpu --weights cpu.safetensors song.mp3
 cargo run --release --features gpu --example gpu_bench -- cpu.safetensors   # kernels vs the CPU's, GFLOP/s
 ```
 
@@ -172,5 +172,5 @@ To measure and tune it on a machine (N threads):
 ```bash
 cargo run --release --example bench -- --threads N --tune     # kernel peak, linear layers, best SHEETSAGE_ROWS / SHEETSAGE_KC
 cargo run --release --example attention -- 7500 N --sharp 20  # the attention core on a 300 s window
-SHEETSAGE_PROFILE=1 ./target/release/sheetsage2-cpu --threads N --weights cpu.safetensors song.wav
+SHEETSAGE_PROFILE=1 ./target/release/tsumugi-engine --threads N --weights cpu.safetensors song.wav
 ```

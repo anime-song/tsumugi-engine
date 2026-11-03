@@ -6,8 +6,8 @@
 use std::time::Instant;
 
 use rayon::prelude::*;
-use sheetsage2_cpu::gemm::{self, Act, MR, NR};
-use sheetsage2_cpu::weights::{Linear, Panels};
+use tsumugi_engine::gemm::{self, Act, MR, NR};
+use tsumugi_engine::weights::{Linear, Panels};
 
 fn leak<T>(v: Vec<T>) -> &'static [T] {
     Box::leak(v.into_boxed_slice())
@@ -17,7 +17,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let threads = args.iter().position(|a| a == "--threads").and_then(|i| args.get(i + 1)?.parse().ok());
     let threads: usize = threads.unwrap_or(std::thread::available_parallelism().map_or(1, |n| n.get()));
-    sheetsage2_cpu::simd::init_threads(Some(threads)).unwrap();
+    tsumugi_engine::simd::init_threads(Some(threads)).unwrap();
     let (a, b) = (vec![1.0f32; MR * 256], vec![0.5f32; 256 * NR]);
     let reps = 200_000;
     for t in [1, threads] {

@@ -2,14 +2,14 @@
 
 use std::time::Instant;
 
-use sheetsage2_cpu::encoder::{HEAD_DIM, HEADS, WIDTH, attend};
-use sheetsage2_cpu::gemm::{MR, NR};
+use tsumugi_engine::encoder::{HEAD_DIM, HEADS, WIDTH, attend};
+use tsumugi_engine::gemm::{MR, NR};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let frames: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(2500);
     let threads: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
-    sheetsage2_cpu::simd::init_threads(Some(threads)).unwrap();
+    tsumugi_engine::simd::init_threads(Some(threads)).unwrap();
     let padded = frames.div_ceil(NR) * NR;
     let mut seed = 1u32;
     let mut rand = || {

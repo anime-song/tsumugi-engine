@@ -2,21 +2,21 @@
 //! core on random inputs.  `cargo run --release --features gpu --example gpu_bench -- cpu.safetensors [FRAMES]`
 //! (FRAMES defaults to 7500, a whole 300 s window).
 
-use sheetsage2_cpu::encoder::{HEAD_DIM, HEADS, WIDTH, attend};
-use sheetsage2_cpu::gemm::{self, Act, MR, NR};
-use sheetsage2_cpu::gpu::GpuEncoder;
-use sheetsage2_cpu::weights::Weights;
+use tsumugi_engine::encoder::{HEAD_DIM, HEADS, WIDTH, attend};
+use tsumugi_engine::gemm::{self, Act, MR, NR};
+use tsumugi_engine::gpu::GpuEncoder;
+use tsumugi_engine::weights::Weights;
 
 fn max_diff(a: &[f32], b: &[f32]) -> (f32, f32) {
     let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
     (d, a.iter().map(|v| v.abs()).fold(0.0, f32::max))
 }
 
-fn main() -> sheetsage2_cpu::Result<()> {
+fn main() -> tsumugi_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let weights = Weights::open(std::path::Path::new(args.get(1).ok_or("usage: gpu_bench cpu.safetensors [FRAMES]")?))?;
     let frames: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(7500);
-    sheetsage2_cpu::simd::init_threads(None)?;
+    tsumugi_engine::simd::init_threads(None)?;
     let gpu = GpuEncoder::load(&weights, 1)?;
     println!("{}", gpu.adapter);
     let mut seed = 7u32;

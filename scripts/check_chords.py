@@ -2,7 +2,7 @@
 
     python scripts/check_chords.py --out-dir DIR [--model REPO_OR_FOLDER] AUDIO ...
 
-reads ``<DIR>/<song>.chords.json`` (``sheetsage2-cpu --chords``), runs ``HeadChords.probabilities`` and the decoder
+reads ``<DIR>/<song>.chords.json`` (``tsumugi-engine --chords``), runs ``HeadChords.probabilities`` and the decoder
 on the beats, downbeats and keys stored there, and compares the chords (times, labels, roots, qualities, basses).
 """
 

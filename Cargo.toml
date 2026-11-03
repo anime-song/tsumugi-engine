@@ -1,5 +1,5 @@
 [package]
-name = "sheetsage2-cpu"
+name = "tsumugi-engine"
 version = "0.1.0"
 edition = "2024"
 

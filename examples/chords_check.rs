@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use safetensors::tensor::{Dtype, TensorView};
-use sheetsage2_cpu::chords::{Chords, Info};
+use tsumugi_engine::chords::{Chords, Info};
 
-fn main() -> sheetsage2_cpu::Result<()> {
+fn main() -> tsumugi_engine::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let model = Chords::load(args[0].as_ref())?;
     let bytes = std::fs::read(&args[1])?;
@@ -43,7 +43,7 @@ fn main() -> sheetsage2_cpu::Result<()> {
     let t = Instant::now();
     let p = model.probabilities(&wave, &info);
     eprintln!("probabilities {:.2} s", t.elapsed().as_secs_f64());
-    sheetsage2_cpu::profile::report();
+    tsumugi_engine::profile::report();
     let t = Instant::now();
     let chords = model.decoder.decode(&p, &info);
     eprintln!("decode {:.3} s, {} chords", t.elapsed().as_secs_f64(), chords.len());
