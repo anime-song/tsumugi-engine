@@ -1,4 +1,4 @@
-//! The exported weights (`sheetsage2_refined.export_cpu`): one safetensors file, memory-mapped for the life of the
+//! The exported weights (`python/export_sheetsage.py`): one safetensors file, memory-mapped for the life of the
 //! process, so the weights are read from the page cache instead of copied onto the heap.
 
 use std::collections::HashMap;
@@ -89,7 +89,7 @@ pub struct Weights {
 
 impl Weights {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_format(path, "sheetsage2-cpu/1", "sheetsage2_refined.export_cpu")
+        Self::open_format(path, "sheetsage2-cpu/1", "python/export_sheetsage.py")
     }
 
     /// A file of another `format` (its metadata's `format`), written by `exporter`.
@@ -131,7 +131,7 @@ impl Weights {
         Ok((&self.map[range.clone()], shape))
     }
 
-    /// The bytes as `T`s (`f32`, `u16` or `i8`), copied only if the file left them misaligned (export_cpu does not).
+    /// The bytes as `T`s (`f32`, `u16` or `i8`), copied only if the file left them misaligned (the exporter does not).
     fn cast<T: Copy>(bytes: &'static [u8], name: &str) -> Result<&'static [T]> {
         let size = std::mem::size_of::<T>();
         if !bytes.len().is_multiple_of(size) {

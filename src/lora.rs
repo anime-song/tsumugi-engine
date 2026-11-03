@@ -1,4 +1,4 @@
-//! LoRA adapters applied at run time (`python -m sheetsage2_refined.export_cpu out.lora.safetensors --adapter ...`):
+//! LoRA adapters applied at run time (`python python/export_sheetsage.py out.lora.safetensors --adapter ...`):
 //! the base weights stay as they are and each adapted linear layer adds `(x A^T) B^T + db`, two thin products of
 //! rank `R` (a few per cent of the layer's own work at the ranks LoRA uses).  An adapter is read into memory as
 //! float16 (a few MiB to a few tens) and can be swapped or dropped between songs without touching the 1.2 GiB of
@@ -87,7 +87,7 @@ impl Adapter {
         let metadata = header.metadata().clone().unwrap_or_default();
         if metadata.get("format").map(String::as_str) != Some(FORMAT) {
             return Err(format!(
-                "{}: not a {FORMAT} file (write it with sheetsage2_refined.export_cpu --adapter)",
+                "{}: not a {FORMAT} file (write it with python/export_sheetsage.py --adapter)",
                 path.display()
             )
             .into());

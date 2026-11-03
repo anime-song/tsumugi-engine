@@ -81,7 +81,7 @@ pub fn tracked_json(t: &tracker::Tracked, audio: &str, duration: f64) -> Value {
     })
 }
 
-/// The melody decoding settings stored by `export_cpu` (`melody_tracker.decoding`).
+/// The melody decoding settings stored by `python/export_sheetsage.py` (`melody_tracker.decoding`).
 pub fn line_options(decoding: &Value) -> LineOptions {
     let mut o = LineOptions::default();
     let get = |k: &str| decoding.get(k).and_then(Value::as_f64);

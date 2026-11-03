@@ -7,7 +7,7 @@
 //! do, and with `--logits` also `<stem>.heads.safetensors` with each head's logits (`<head>.<output>`,
 //! `[frames, width]`) and, for the section and key models, the encoder states' block means (`encoder.states`).
 //! AUDIO may be a WAV / FLAC / MP3 / Ogg file, or a `.f32` file of raw little-endian float32 samples, mono at 24 kHz.
-//! `--adapter` applies a LoRA adapter (`export_cpu --adapter`) to the encoder at run time.
+//! `--adapter` applies a LoRA adapter (`export_sheetsage.py --adapter`) to the encoder at run time.
 //! `--cpu-heads N` (with `--device gpu`) computes the last N of the 16 attention heads on the CPU while the GPU
 //! computes the others.
 

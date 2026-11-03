@@ -10,7 +10,7 @@ own, and one binary runs both.
 
 ```bash
 pip install git+https://github.com/anime-song/SheetSage2-Refined git+https://github.com/anime-song/Tsumugi-Chords
-python -m sheetsage2_refined.export_cpu cpu.safetensors [--dtype f16|f32|i8] [--lora ADAPTER --lora-scale S]
+python python/export_sheetsage.py cpu.safetensors [--dtype f16|f32|i8] [--lora ADAPTER --lora-scale S]
 python python/export_chords.py chords.safetensors          # Tsumugi-Chords (anime-song/Tsumugi-Chords)
 cargo build --release
 ./target/release/tsumugi-engine --weights cpu.safetensors [--chords chords.safetensors] [--adapter LORA] \
@@ -46,18 +46,18 @@ then reads it resampled, in both channels).
 ## LoRA adapters at run time
 
 ```bash
-python -m sheetsage2_refined.export_cpu my.lora.safetensors --adapter LORA.safetensors [--lora-scale S]
+python python/export_sheetsage.py my.lora.safetensors --adapter LORA.safetensors [--lora-scale S]
 ./target/release/tsumugi-engine --weights cpu.safetensors --adapter my.lora.safetensors song.mp3
 ```
 
-`--adapter` (in `export_cpu`) writes only the adapter, folded the way the weights it changes are: `A` with the
+`--adapter` (in `export_sheetsage.py`) writes only the adapter, folded the way the weights it changes are: `A` with the
 norm's scale, `B` with the scale, the feed-forward's 0.5 and q's `1/sqrt(64)`, and the shift the norm's `beta` (or
 GRN's) sends through the adapter as an extra bias, all as float16 (a rank-16 adapter on q, k, v, out and both
 feed-forwards of all 24 blocks: 22 MiB). The engine keeps the 1.2 GB base export as it is and adds
 `(x A^T) B^T + db` to each adapted layer's output, before its GELU; q, k and v keep their own `B`s inside the
 shared `qkv` layer. Any of the encoder's linear layers can be adapted (the Conformer's, the pointwise convolutions,
 the ConvNeXt stages' and their downsampling); a LoRA on a depthwise convolution has to be merged with
-`export_cpu --lora` instead. `Model::set_adapter` swaps or removes an adapter between songs, on the CPU or the GPU.
+`export_sheetsage.py --lora` instead. `Model::set_adapter` swaps or removes an adapter between songs, on the CPU or the GPU.
 
 On a 60 s song the rank-16 adapter above costs no measurable time (10.9-11.3 s with it, 10.9-11.2 s without) and
 33 MiB of memory. Against the merged export the logits agree within 1.5e-5 with the adapter in float32, and within
@@ -99,7 +99,7 @@ within 2e-5. Its speed has to be measured on the GPU it runs on:
 
 ## How it works
 
-* `export_cpu` folds every constant it can: LayerNorm scales and shifts into the linear layer that follows, the
+* `export_sheetsage.py` folds every constant it can: LayerNorm scales and shifts into the linear layer that follows, the
   feed-forward `0.5`, attention's `1/sqrt(64)`, the downsampling LayerNorm into the stride-2 convolution, GRN's shift
   into `fc2`'s bias. q, k and v are one matrix. Linear weights are stored in 16-column panels, the order the kernel
   reads them, as float16, float32 or int8 (scale per output channel), and the file is memory-mapped.

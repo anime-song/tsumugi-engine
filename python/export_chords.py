@@ -2,7 +2,7 @@
 
     python python/export_chords.py chords.safetensors [--model REPO_OR_FOLDER] [--revision REV]
 
-writes one safetensors file next to SheetSage2-Refined's export (``sheetsage2_refined.export_cpu``), which the
+writes one safetensors file next to SheetSage2-Refined's export (``python/export_sheetsage.py``), which the
 engine reads for the beats, downbeats and keys the chord model takes.  As there, constants are folded where the
 engine would otherwise compute them per song:
 

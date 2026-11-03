@@ -362,11 +362,11 @@ struct Inputs {
 }
 
 impl BarModel {
-    /// `name`: `sections` or `keys`, as `export_cpu` writes them (`bar_models` in the metadata).
+    /// `name`: `sections` or `keys`, as `python/export_sheetsage.py` writes them (`bar_models` in the metadata).
     pub fn load(w: &Weights, name: &str) -> Result<Self> {
         let all: Value = serde_json::from_str(w.metadata.get("bar_models").map_or("{}", |s| s))?;
         let spec = all.get(name).ok_or_else(|| {
-            format!("the weights have no {name} model (export them again with this version's export_cpu)")
+            format!("the weights have no {name} model (export them again with python/export_sheetsage.py)")
         })?;
         let config = &spec["config"];
         let get = |k: &str| config[k].as_u64().map(|v| v as usize).ok_or_else(|| format!("{name}: no {k} in config"));

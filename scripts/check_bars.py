@@ -1,6 +1,6 @@
 """Check the engine's section and key models (Rust) against the Python ones on the same logits and states.
 
-    python rust/scripts/check_bars.py --weights cpu.safetensors [--model REPO_OR_FOLDER] LOGITS.heads.safetensors ...
+    python scripts/check_bars.py --weights cpu.safetensors [--model REPO_OR_FOLDER] LOGITS.heads.safetensors ...
 
 Each file (``tsumugi-engine --heads section,key --logits``: the beat, melody and chord heads' logits and the encoder
 states' block means) goes through ``tsumugi-engine --from-logits --heads section,key`` and through
@@ -19,8 +19,8 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from sheetsage2_refined import cpu  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+import sheetsage_cpu as cpu  # noqa: E402
 from sheetsage2_refined.beats import HeadBeats  # noqa: E402
 from sheetsage2_refined.keys import KEYS, HeadKeys, key_files, load_keys  # noqa: E402
 from sheetsage2_refined.pipeline import DEFAULT_MODEL, mode_bias, model_folder  # noqa: E402

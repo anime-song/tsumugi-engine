@@ -1,9 +1,9 @@
 """Check the engine's trackers (Rust) against the Python ones on the same logits.
 
-    python rust/scripts/check_post.py --weights cpu.safetensors LOGITS.heads.safetensors ... [--noise S --copies N]
+    python scripts/check_post.py --weights cpu.safetensors LOGITS.heads.safetensors ... [--noise S --copies N]
 
 Each file (``tsumugi-engine --logits``, or ``check.py --keep``'s ``*.torch.safetensors``) goes through
-``tsumugi-engine --from-logits`` and through ``sheetsage2_refined.cpu``'s trackers; the beats, downbeats, bars,
+``tsumugi-engine --from-logits`` and through ``python/sheetsage_cpu.py``'s trackers; the beats, downbeats, bars,
 meters and notes must be equal.  ``--noise`` adds copies with Gaussian noise of that size on every logit, to try
 more paths through the trackers' Viterbis.
 """
@@ -19,8 +19,8 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from sheetsage2_refined import cpu  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+import sheetsage_cpu as cpu  # noqa: E402
 
 
 def main():

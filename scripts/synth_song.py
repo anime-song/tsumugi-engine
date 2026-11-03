@@ -1,7 +1,7 @@
 """A synthetic song for testing the CPU engine without real audio: drums, bass, chords and a sung-like melody on a
 beat grid with meter changes.  Not music anyone would enjoy, but it has clear beats, bars and a melody line.
 
-    python rust/scripts/synth_song.py out.wav [--seconds 330] [--seed 0] [--rate 44100]
+    python scripts/synth_song.py out.wav [--seconds 330] [--seed 0] [--rate 44100]
 
 writes the WAV (16-bit) and ``out.truth.json`` with its beats, downbeats and melody notes.
 """

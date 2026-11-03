@@ -1,6 +1,6 @@
 """Check the CPU engine against PyTorch on one song: the heads' logits, then the beats and notes the trackers make.
 
-    python rust/scripts/check.py song.wav --weights cpu.safetensors --model MODEL_FOLDER [--threads N] [--keep DIR]
+    python scripts/check.py song.wav --weights cpu.safetensors --model MODEL_FOLDER [--threads N] [--keep DIR]
 
 PyTorch runs SheetSage2's encoder and the model's beat and melody heads in float32 on the CPU
 (``beats.frame_outputs``); the engine gets the very same 24 kHz waveform as a ``.f32`` file, so only the engine's
@@ -20,8 +20,8 @@ import numpy as np
 import torch
 from safetensors.numpy import save_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from sheetsage2_refined import cpu  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+import sheetsage_cpu as cpu  # noqa: E402
 from sheetsage2_refined.beats import frame_outputs, load_encoder  # noqa: E402
 from sheetsage2_refined.heads import load_head  # noqa: E402
 from sheetsage2_refined.transcribe import load_waveform  # noqa: E402
@@ -56,7 +56,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("audio", type=Path)
     parser.add_argument("--weights", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True, help="the model folder export_cpu read")
+    parser.add_argument("--model", type=Path, required=True, help="the model folder export_sheetsage.py read")
     parser.add_argument("--binary", type=Path, default=cpu.DEFAULT_BINARY)
     parser.add_argument("--threads", type=int)
     parser.add_argument("--keep", type=Path, help="keep the reference logits here (reused when present)")

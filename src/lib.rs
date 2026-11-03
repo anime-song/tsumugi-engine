@@ -1,5 +1,5 @@
 //! SheetSage2-Refined's beat and melody heads on the CPU: the MERT-v2 encoder and the frame heads, from weights
-//! exported by `python -m sheetsage2_refined.export_cpu`.
+//! exported by `python python/export_sheetsage.py`.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
