@@ -3,6 +3,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod attention_q16;
 pub mod audio;
 pub mod bars;
 pub mod chords;
@@ -109,9 +110,13 @@ impl Model {
         if self.gpu.is_some() {
             return Err("int16 is for the CPU only".into());
         }
-        if simd::avx2() && self.encoder.quantize() {
-            // the encoder's float16 pages are not read again; the heads' tensors come back from the page cache
-            self.weights.release_pages();
+        if simd::avx2() {
+            // the attention core on int16 too: being evaluated, opt-in for now
+            self.encoder.int16_attention = std::env::var("TSUMUGI_INT16_ATTENTION").is_ok_and(|v| v == "1");
+            if self.encoder.quantize() {
+                // the encoder's float16 pages are not read again; the heads' tensors come back from the page cache
+                self.weights.release_pages();
+            }
         }
         Ok(())
     }

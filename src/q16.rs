@@ -155,7 +155,7 @@ pub fn product(
 
 /// One row's slice (times `gain`) as pairs of int16 at `dst[p * MR + r]` (`ceil(len / 2)` pairs, the odd tail paired
 /// with 0), scaled to at most `A_MAX`; returns the scale.
-fn quantize_row(x: &[f32], gain: Option<&[f32]>, dst: &mut [i32], r: usize) -> f32 {
+pub(crate) fn quantize_row(x: &[f32], gain: Option<&[f32]>, dst: &mut [i32], r: usize) -> f32 {
     assert!(dst.len() >= x.len().div_ceil(2) * MR && r < MR);
     #[cfg(target_arch = "x86_64")]
     if simd::avx2() {
@@ -224,7 +224,7 @@ unsafe fn quantize_row_avx2(x: &[f32], gain: Option<&[f32]>, dst: &mut [i32], r:
 /// int16 (`b` as `[np][16][2]`).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn kernel(np: usize, a: &[i32], b: &[i16], rs: &[f32], cs: &[f32], c: &mut [f32], ldc: usize, add: bool) {
+pub(crate) fn kernel(np: usize, a: &[i32], b: &[i16], rs: &[f32], cs: &[f32], c: &mut [f32], ldc: usize, add: bool) {
     assert!(a.len() >= MR * np && b.len() >= np * NR * 2 && rs.len() >= MR && cs.len() >= NR);
     assert!(c.len() >= (MR - 1) * ldc + NR);
     #[cfg(target_arch = "x86_64")]

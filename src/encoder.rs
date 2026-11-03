@@ -88,6 +88,8 @@ pub struct Encoder {
     blocks: Vec<Block>,
     rope_cos: &'static [f32], // [max frames][HEAD_DIM / 2]
     rope_sin: &'static [f32],
+    /// The attention core on int16 values (`crate::attention_q16`).
+    pub int16_attention: bool,
 }
 
 /// `[C, k]` -> `[k][C]`, so a depthwise convolution vectorises over channels.
@@ -167,6 +169,7 @@ impl Encoder {
             blocks,
             rope_cos: w.f32("rope.cos")?,
             rope_sin: w.f32("rope.sin")?,
+            int16_attention: false,
         })
     }
 
@@ -350,7 +353,15 @@ impl Encoder {
                 }
             }
         });
-        crate::profile::time("attention core", || attend(&mut s.rows, &s.keys, &s.values, padded, frames));
+        crate::profile::time("attention core", || {
+            if self.int16_attention {
+                let quant = s.quant.get_or_insert_with(|| crate::attention_q16::Quantized::new(padded));
+                quant.fill(&s.keys, &s.values, frames);
+                crate::attention_q16::attend(&mut s.rows, quant, frames);
+            } else {
+                attend(&mut s.rows, &s.keys, &s.values, padded, frames);
+            }
+        });
         gemm::linear(&s.rows, WIDTH, frames, &b.out, x, WIDTH, Act::None, true, None);
     }
 }
@@ -362,6 +373,7 @@ struct Scratch {
     keys: Vec<f32>,   // [HEADS][padded / 16][HEAD_DIM][16]: rotated keys in panels of 16
     values: Vec<f32>, // [HEADS][padded][HEAD_DIM]
     padded: usize,    // frames rounded up to a whole panel
+    quant: Option<crate::attention_q16::Quantized>, // the keys and values as int16 (`int16_attention`)
 }
 
 impl Scratch {
@@ -372,6 +384,7 @@ impl Scratch {
             keys: vec![0.0; HEADS * HEAD_DIM * padded],
             values: vec![0.0; HEADS * HEAD_DIM * padded],
             padded,
+            quant: None,
         }
     }
 }
@@ -489,7 +502,7 @@ pub fn attend_heads(
     });
 }
 
-fn row_max(row: &[f32]) -> f32 {
+pub(crate) fn row_max(row: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2() {
         return unsafe { row_max_avx2(row) };
@@ -520,7 +533,7 @@ unsafe fn row_max_avx2(row: &[f32]) -> f32 {
 const FLUSH: f32 = -40.0;
 
 /// `row[j] = exp(row[j] - max)` (zero below `FLUSH`), returning the sum.
-fn exp_shifted(row: &mut [f32], max: f32) -> f32 {
+pub(crate) fn exp_shifted(row: &mut [f32], max: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2() {
         return unsafe { exp_shifted_avx2(row, max) };
