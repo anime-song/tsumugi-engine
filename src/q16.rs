@@ -33,27 +33,40 @@ pub fn quantize(lin: &Linear) -> Linear {
     let (n, k) = (lin.n, lin.k);
     let panels = lin.panels();
     let pairs = k.div_ceil(2);
-    let value = |i: usize| -> f32 {
-        match &lin.w {
-            Panels::F32(w) => w[i],
-            Panels::F16(w) => half::f16::from_bits(w[i]).to_f32(),
-            Panels::I8(w) => {
-                let col = (i / (k * NR)) * NR + i % NR;
-                if col < n { w[i] as f32 * lin.scale.expect("int8 weights without scales")[col] } else { 0.0 }
-            }
-            Panels::Q16(_) => panic!("already int16"),
-        }
-    };
     let mut q = vec![0i16; panels * pairs * NR * 2];
     let mut scale = vec![0.0f32; panels * NR];
     q.par_chunks_mut(pairs * NR * 2).zip(scale.par_chunks_mut(NR)).enumerate().for_each(|(panel, (q, scale))| {
-        let at = |p: usize, j: usize| value((panel * k + p) * NR + j);
-        for (j, s) in scale.iter_mut().enumerate() {
-            let max = (0..k).map(|p| at(p, j).abs()).fold(0.0f32, f32::max);
-            *s = max / W_MAX;
-            let inv = if max > 0.0 { W_MAX / max } else { 0.0 };
-            for p in 0..k {
-                q[((p / 2) * NR + j) * 2 + p % 2] = (at(p, j) * inv).round_ties_even() as i16;
+        // the panel `[k][16]` as float32
+        let at = panel * k * NR;
+        let w: Vec<f32> = match &lin.w {
+            Panels::F32(w) => w[at..at + k * NR].to_vec(),
+            Panels::F16(w) => {
+                let mut out = vec![0.0f32; k * NR];
+                crate::gemm::convert_f16(&w[at..at + k * NR], &mut out);
+                out
+            }
+            Panels::I8(w) => {
+                let s = lin.scale.expect("int8 weights without scales");
+                let mut g = [0.0f32; NR];
+                let cols = NR.min(n - panel * NR);
+                g[..cols].copy_from_slice(&s[panel * NR..panel * NR + cols]);
+                w[at..at + k * NR].chunks(NR).flat_map(|row| row.iter().zip(&g).map(|(&v, g)| v as f32 * g)).collect()
+            }
+            Panels::Q16(_) => panic!("already int16"),
+        };
+        let mut max = [0.0f32; NR];
+        for row in w.chunks_exact(NR) {
+            max.iter_mut().zip(row).for_each(|(m, v)| *m = m.max(v.abs()));
+        }
+        let mut inv = [0.0f32; NR];
+        for j in 0..NR {
+            scale[j] = max[j] / W_MAX;
+            inv[j] = if max[j] > 0.0 { W_MAX / max[j] } else { 0.0 };
+        }
+        for (p, row) in w.chunks_exact(NR).enumerate() {
+            let to = &mut q[(p / 2) * NR * 2..];
+            for (j, (v, g)) in row.iter().zip(&inv).enumerate() {
+                to[j * 2 + p % 2] = (v * g).round_ties_even() as i16;
             }
         }
     });

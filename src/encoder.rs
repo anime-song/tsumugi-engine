@@ -196,6 +196,13 @@ impl Encoder {
         out
     }
 
+    /// Round the linear layers' weights to int16 (`crate::q16`; their products then run on int16 values).
+    pub fn quantize(&mut self) {
+        for (_, lin) in self.linears_mut() {
+            *lin = crate::q16::quantize(lin);
+        }
+    }
+
     /// Apply a LoRA adapter from now on (`None`: the base weights alone).
     pub fn set_adapter(&mut self, adapter: Option<&Adapter>) -> Result<()> {
         Adapter::attach(adapter, self.linears_mut())

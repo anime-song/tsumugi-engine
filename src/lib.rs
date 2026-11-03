@@ -101,6 +101,20 @@ impl Model {
         Ok(model)
     }
 
+    /// The encoder's linear layers on int16 values (`crate::q16`; the CPU only, with AVX2).
+    pub fn quantize(&mut self) -> Result<()> {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return Err("int16 is for the CPU only".into());
+        }
+        if simd::avx2() {
+            self.encoder.quantize();
+            // the encoder's float16 pages are not read again; the heads' tensors come back from the page cache
+            self.weights.release_pages();
+        }
+        Ok(())
+    }
+
     pub fn set_adapter(&mut self, adapter: Option<&lora::Adapter>) -> Result<()> {
         #[cfg(feature = "gpu")]
         if let Some(gpu) = &mut self.gpu {

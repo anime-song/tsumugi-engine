@@ -14,7 +14,7 @@ python -m sheetsage2_refined.export_cpu cpu.safetensors [--dtype f16|f32|i8] [--
 python python/export_chords.py chords.safetensors          # Tsumugi-Chords (anime-song/Tsumugi-Chords)
 cargo build --release
 ./target/release/tsumugi-engine --weights cpu.safetensors [--chords chords.safetensors] [--adapter LORA] \
-    [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--tempo-weight W] [--logits] song.mp3 ...
+    [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--tempo-weight W] [--precision f32|int16] [--logits] song.mp3 ...
 ```
 
 writes `<out-dir>/<song>.beats.json`, `<song>.melody.json`, `<song>.sections.json` and `<song>.keys.json` (those
@@ -29,6 +29,14 @@ With `--chords`, also `<song>.chords.json` and `<song>.chords.lab` as `tsumugi-c
 reads the song in stereo at 25.6 kHz with the beats, downbeats and keys of the same run (the key model runs whether
 or not `key` is in `--heads`). Export both files from the versions that go together: Tsumugi-Chords' `config.json`
 names the SheetSage2-Refined revision it was trained with (`beats_keys`, v0.5.0 for the first release).
+
+`--precision int16` runs the encoder's linear layers and the chord model's linear layers and convolutions on int16
+values (`vpmaddwd`, twice the multiply-adds of a float32 FMA per instruction; for AVX2 CPUs without AVX-VNNI):
+the weights are rounded at load to 12 bits per output channel, the activations to 13 bits per row and 256 values
+of k (the convolutions: per map). On synthetic test songs (60 s, 100 s, 330 s) the outputs equal float32's except
+for a few beats a couple of milliseconds apart and one chord quality of 137 in the 330 s song. The int16 weights
+are a copy on the heap (about 1.1 GB more memory than float32, whose pages are mapped from the file). Whether it
+pays depends on the CPU: time both on yours.
 
 `--threads` defaults to one per logical CPU; on a CPU with SMT try the number of physical cores as well.
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz (and 25.6 kHz for the chords) as

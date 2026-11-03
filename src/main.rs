@@ -161,6 +161,11 @@ fn main() -> Result<()> {
         "gpu" => return Err("built without the GPU encoder: cargo build --release --features gpu".into()),
         _ => usage(),
     };
+    if int16 {
+        let t = Instant::now();
+        model.quantize()?;
+        eprintln!("encoder on int16 ({:.2} s)", t.elapsed().as_secs_f64());
+    }
     if let Some(path) = &adapter {
         let adapter = tsumugi_engine::lora::Adapter::open(path)?;
         model.set_adapter(Some(&adapter))?;
