@@ -107,11 +107,42 @@ impl Model {
         if self.gpu.is_some() {
             return Err("int16 is for the CPU only".into());
         }
-        if simd::avx2() {
-            self.encoder.quantize();
+        if simd::avx2() && self.encoder.quantize() {
             // the encoder's float16 pages are not read again; the heads' tensors come back from the page cache
             self.weights.release_pages();
         }
+        Ok(())
+    }
+
+    /// Write the weights with the encoder's linear layers as int16 (`quantize` first): a file that loads without
+    /// rounding, its int16 weights mapped (and shared between processes) as float16 ones are.
+    pub fn save_int16(&mut self, path: &std::path::Path) -> Result<()> {
+        use safetensors::tensor::{Dtype, TensorView};
+        self.quantize()?;
+        let mut replaced: std::collections::HashMap<String, (Dtype, Vec<usize>, Vec<u8>)> = Default::default();
+        for (name, lin) in self.encoder.linears_mut() {
+            let weights::Panels::Q16(w) = &lin.w else { return Err(format!("{name}: not int16 (no AVX2?)").into()) };
+            if lin.k % 2 != 0 {
+                return Err(format!("{name}: odd k {}", lin.k).into());
+            }
+            let scale = lin.scale.ok_or("int16 weights without scales")?;
+            let w_bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+            replaced.insert(format!("{name}.w"), (Dtype::I16, vec![lin.panels(), lin.k, weights::PANEL], w_bytes));
+            let s_bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+            replaced.insert(format!("{name}.s"), (Dtype::F32, vec![scale.len()], s_bytes));
+        }
+        let mut views: Vec<(String, TensorView)> = Vec::new();
+        for (name, dtype, shape, bytes) in self.weights.tensors() {
+            if !replaced.contains_key(&name) {
+                views.push((name, TensorView::new(dtype, shape, bytes)?));
+            }
+        }
+        for (name, (dtype, shape, bytes)) in &replaced {
+            views.push((name.clone(), TensorView::new(*dtype, shape.clone(), bytes)?));
+        }
+        let mut meta = self.weights.metadata.clone();
+        meta.insert("precision".into(), "int16".into());
+        safetensors::serialize_to_file(views, Some(meta), path)?;
         Ok(())
     }
 

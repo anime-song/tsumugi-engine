@@ -21,7 +21,7 @@ use tsumugi_engine::{Frames, MemoryWatch, Model, Outputs, Result, audio, bars, e
 fn usage() -> ! {
     eprintln!(
         "usage: tsumugi-engine --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--device cpu|gpu] [--logits] \
-         [--cpu-heads N] [--tempo-weight W] [--hold P] [--chords FILE] [--precision f32|int16] AUDIO..."
+         [--cpu-heads N] [--tempo-weight W] [--hold P] [--chords FILE] [--precision f32|int16] AUDIO... | --weights FILE --save-int16 OUT"
     );
     std::process::exit(2)
 }
@@ -116,11 +116,13 @@ fn main() -> Result<()> {
     let mut cpu_heads = 0usize;
     let mut chords_file = None;
     let mut precision = "f32".to_string();
+    let mut save_int16 = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--weights" => weights = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--chords" => chords_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--precision" => precision = args.next().unwrap_or_else(|| usage()),
+            "--save-int16" => save_int16 = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--adapter" => adapter = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--threads" => threads = Some(args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| usage())),
             "--out-dir" => out_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
@@ -136,7 +138,7 @@ fn main() -> Result<()> {
         }
     }
     let Some(weights) = weights else { usage() };
-    if inputs.is_empty() {
+    if inputs.is_empty() && save_int16.is_none() {
         usage();
     }
     tsumugi_engine::simd::init_threads(threads)?;
@@ -161,6 +163,12 @@ fn main() -> Result<()> {
         "gpu" => return Err("built without the GPU encoder: cargo build --release --features gpu".into()),
         _ => usage(),
     };
+    if let Some(out) = &save_int16 {
+        let t = Instant::now();
+        model.save_int16(out)?;
+        eprintln!("{}: the weights with the encoder on int16 ({:.1} s)", out.display(), t.elapsed().as_secs_f64());
+        return Ok(());
+    }
     if int16 {
         let t = Instant::now();
         model.quantize()?;
@@ -201,7 +209,7 @@ fn main() -> Result<()> {
     eprintln!(
         "loaded {} ({}) in {:.2} s, AVX2: {}",
         weights.display(),
-        model.weights.metadata.get("dtype").map_or("?", |s| s),
+        model.weights.metadata.get("precision").or(model.weights.metadata.get("dtype")).map_or("?", |s| s),
         started.elapsed().as_secs_f64(),
         tsumugi_engine::simd::avx2()
     );

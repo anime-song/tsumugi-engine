@@ -35,8 +35,18 @@ values (`vpmaddwd`, twice the multiply-adds of a float32 FMA per instruction; fo
 the weights are rounded at load to 12 bits per output channel, the activations to 13 bits per row and 256 values
 of k (the convolutions: per map). On synthetic test songs (60 s, 100 s, 330 s) the outputs equal float32's except
 for a few beats a couple of milliseconds apart and one chord quality of 137 in the 330 s song. The int16 weights
-are a copy on the heap (about 1.1 GB more memory than float32, whose pages are mapped from the file). Whether it
-pays depends on the CPU: time both on yours.
+are a copy on the heap (about 1.1 GB more memory than float32, whose pages are mapped from the file; see
+`--save-int16` below). Whether it pays depends on the CPU: time both on yours.
+
+```bash
+./target/release/tsumugi-engine --weights cpu.safetensors --save-int16 cpu.int16.safetensors
+./target/release/tsumugi-engine --weights cpu.int16.safetensors --precision int16 [--chords chords.safetensors] song.mp3
+```
+
+`--save-int16` writes the weights with the encoder's layers already rounded: such a file loads without the rounding
+and is mapped from the file as float16 weights are, so processes on one machine share it (the encoder then always
+runs on int16; `--precision int16` still applies to the chord model, whose 30 MB are rounded at load). The outputs
+are those of `--precision int16` on the float16 file.
 
 `--threads` defaults to one per logical CPU; on a CPU with SMT try the number of physical cores as well.
 WAV, FLAC, MP3 and Ogg Vorbis are decoded by Symphonia and resampled to 24 kHz (and 25.6 kHz for the chords) as

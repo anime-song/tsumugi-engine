@@ -58,9 +58,9 @@ pub enum Panels {
     F32(Floats),
     F16(Shared<u16>),
     I8(&'static [i8]),
-    /// Quantised on the CPU at load (`gemm::quantize`): `[ceil(n / 16), ceil(k / 2), 16, 2]`, pairs of k per column
-    /// for `vpmaddwd`, with a scale per output channel.
-    Q16(Arc<[i16]>),
+    /// Rounded to int16 (`q16::quantize`, or saved so by `--save-int16`): `[ceil(n / 16), ceil(k / 2), 16, 2]`, pairs
+    /// of k per column for `vpmaddwd`, with a scale per output channel (`ceil(n / 16) * 16` of them).
+    Q16(Shared<i16>),
 }
 
 /// A linear layer `y = W x + b`, `W` `[n, k]` stored as panels `[ceil(n / 16), k, 16]`; int8 weights carry a scale
@@ -131,7 +131,7 @@ impl Weights {
         Ok((&self.map[range.clone()], shape))
     }
 
-    /// The bytes as `T`s (`f32`, `u16` or `i8`), copied only if the file left them misaligned (the exporter does not).
+    /// The bytes as `T`s (`f32`, `u16`, `i16` or `i8`), copied only if the file left them misaligned (the exporter does not).
     fn cast<T: Copy>(bytes: &'static [u8], name: &str) -> Result<&'static [T]> {
         let size = std::mem::size_of::<T>();
         if !bytes.len().is_multiple_of(size) {
@@ -154,6 +154,14 @@ impl Weights {
         Self::cast(bytes, name)
     }
 
+    /// Every tensor: name, dtype, shape and bytes.
+    pub fn tensors(&self) -> Vec<(String, Dtype, Vec<usize>, &'static [u8])> {
+        let mut out: Vec<_> =
+            self.tensors.iter().map(|(n, (d, s, r))| (n.clone(), *d, s.clone(), &self.map[r.clone()])).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
         Ok(self.tensors.get(name).ok_or_else(|| format!("missing tensor {name}"))?.1.clone())
     }
@@ -166,6 +174,7 @@ impl Weights {
             Dtype::F32 => Panels::F32(Self::cast(self.raw(&key, Dtype::F32)?.0, &key)?.into()),
             Dtype::F16 => Panels::F16(Self::cast(self.raw(&key, Dtype::F16)?.0, &key)?.into()),
             Dtype::I8 => Panels::I8(Self::cast(self.raw(&key, Dtype::I8)?.0, &key)?),
+            Dtype::I16 => Panels::Q16(Self::cast(self.raw(&key, Dtype::I16)?.0, &key)?.into()),
             other => return Err(format!("{key}: unsupported dtype {other:?}").into()),
         };
         let bias = self.f32(&format!("{name}.b"))?;

@@ -196,11 +196,17 @@ impl Encoder {
         out
     }
 
-    /// Round the linear layers' weights to int16 (`crate::q16`; their products then run on int16 values).
-    pub fn quantize(&mut self) {
+    /// Round the linear layers' weights to int16 (`crate::q16`; their products then run on int16 values); returns
+    /// whether any were not yet (a file saved by `--save-int16` holds them so).
+    pub fn quantize(&mut self) -> bool {
+        let mut changed = false;
         for (_, lin) in self.linears_mut() {
-            *lin = crate::q16::quantize(lin);
+            if !matches!(lin.w, crate::weights::Panels::Q16(_)) {
+                *lin = crate::q16::quantize(lin);
+                changed = true;
+            }
         }
+        changed
     }
 
     /// Apply a LoRA adapter from now on (`None`: the base weights alone).
