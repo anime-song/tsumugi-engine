@@ -95,6 +95,10 @@ impl GroupNorm {
 
     /// Over a channels-last map `[positions, c]`, then GELU if `gelu`.
     fn forward(&self, x: &mut [f32], gelu: bool) {
+        profile::time("chord groupnorm", || self.forward_inner(x, gelu))
+    }
+
+    fn forward_inner(&self, x: &mut [f32], gelu: bool) {
         let c = self.gamma.len();
         let per = c / self.groups;
         let sums: Vec<(f64, f64)> = x
@@ -153,12 +157,33 @@ struct Block {
 /// RMSNorm without its scale (folded into the next layer), eps 1e-6.
 fn rms(x: &[f32], dim: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; x.len()];
-    out.par_chunks_mut(dim).zip(x.par_chunks(dim)).for_each(|(o, x)| {
-        let mean = x.iter().map(|v| v * v).sum::<f32>() / dim as f32;
-        let r = 1.0 / (mean + 1e-6).sqrt();
-        o.iter_mut().zip(x).for_each(|(o, v)| *o = v * r);
-    });
+    out.par_chunks_mut(dim).zip(x.par_chunks(dim)).for_each(|(o, x)| rms_row(x, o));
     out
+}
+
+fn rms_row(x: &[f32], o: &mut [f32]) {
+    let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let r = 1.0 / (mean + 1e-6).sqrt();
+    o.iter_mut().zip(x).for_each(|(o, v)| *o = v * r);
+}
+
+/// Tokens per task in the row-wise parts of a block (a multiple of `gemm::MR`): their norms, products and residuals
+/// run back to back on one thread, the intermediate rows staying in its caches.
+const ROWS: usize = 96;
+
+/// Buffers the blocks reuse: q / k / v / gates `[tokens, 3 * dim + heads]` and the attention's output `[tokens, dim]`.
+#[derive(Default)]
+struct Scratch {
+    qkvg: Vec<f32>,
+    y: Vec<f32>,
+}
+
+impl Scratch {
+    fn reserve(v: &mut Vec<f32>, len: usize) {
+        if v.len() < len {
+            v.resize(len, 0.0);
+        }
+    }
 }
 
 impl Block {
@@ -173,25 +198,29 @@ impl Block {
     }
 
     /// `x` `[steps, row, dim]`; `along_row`: the sequences are the rows (else the columns, through time).
-    fn forward(&self, x: &mut [f32], steps: usize, row: usize, heads: usize, along_row: bool, rope: &Rope) {
+    #[allow(clippy::too_many_arguments)]
+    fn forward(&self, x: &mut [f32], steps: usize, row: usize, heads: usize, along_row: bool, rope: &Rope, s: &mut Scratch) {
         let n = steps * row;
-        let qkvg = self.project(x, n, |t| if along_row { t % row } else { t / row }, heads, rope);
+        self.project(x, n, |t| if along_row { t % row } else { t / row }, heads, rope, &mut s.qkvg);
         let (seqs, len) = if along_row { (steps, row) } else { (row, steps) };
         let token = move |s: usize, p: usize| if along_row { s * row + p } else { p * row + s };
-        let y = attention(&qkvg, self.out.n, heads, seqs, len, token, 0..len, n);
-        drop(qkvg);
-        self.finish(x, &y, n);
+        Scratch::reserve(&mut s.y, n * self.out.n);
+        attention(&s.qkvg, self.qkvg.n, self.out.n, heads, seqs, len, token, 0..len, &mut s.y[..n * self.out.n]);
+        self.finish(x, &s.y, n);
     }
 
     /// The last row block for the outputs of tokens `first..row` of each row only (the chord queries; all tokens
     /// are keys): `[steps, row - first, dim]`.
-    fn forward_tail(&self, x: &[f32], steps: usize, row: usize, heads: usize, rope: &Rope, first: usize) -> Vec<f32> {
+    #[allow(clippy::too_many_arguments)]
+    fn forward_tail(&self, x: &[f32], steps: usize, row: usize, heads: usize, rope: &Rope, first: usize, s: &mut Scratch) -> Vec<f32> {
         let dim = self.out.n;
-        let qkvg = self.project(x, steps * row, |t| t % row, heads, rope);
+        let n = steps * row;
+        self.project(x, n, |t| t % row, heads, rope, &mut s.qkvg);
         let token = move |s: usize, p: usize| s * row + p;
         let tail = row - first;
-        let y = attention(&qkvg, dim, heads, steps, row, token, first..row, steps * row);
-        drop(qkvg);
+        Scratch::reserve(&mut s.y, n * dim);
+        let y = &mut s.y[..n * dim];
+        attention(&s.qkvg, self.qkvg.n, dim, heads, steps, row, token, first..row, y);
         let mut out = vec![0.0f32; steps * tail * dim];
         let mut ys = vec![0.0f32; steps * tail * dim];
         for s in 0..steps {
@@ -203,54 +232,74 @@ impl Block {
         out
     }
 
-    /// RMSNorm, q / k / v / gates and RoPE on q and k by each token's `position`.
-    fn project(&self, x: &[f32], n: usize, position: impl Fn(usize) -> usize + Sync, heads: usize, rope: &Rope) -> Vec<f32> {
+    /// RMSNorm, q / k / v / gates and RoPE on q and k by each token's `position`, into `qkvg` `[n, width]`.
+    #[allow(clippy::too_many_arguments)]
+    fn project(&self, x: &[f32], n: usize, position: impl Fn(usize) -> usize + Sync, heads: usize, rope: &Rope, qkvg: &mut Vec<f32>) {
         let dim = self.out.n;
         let width = self.qkvg.n;
-        let h = rms(x, dim);
-        let mut qkvg = profile::time("chord linear", || lin(&h, n, &self.qkvg, Act::None));
         let hd = dim / heads;
-        qkvg.par_chunks_mut(width).enumerate().for_each(|(t, r)| {
-            let p = position(t);
-            for part in 0..2 {
-                for head in 0..heads {
-                    rope.apply(&mut r[part * dim + head * hd..][..hd], p);
-                }
-            }
+        Scratch::reserve(qkvg, n * width);
+        profile::time("chord project", || {
+            qkvg[..n * width].par_chunks_mut(ROWS * width).zip(x[..n * dim].par_chunks(ROWS * dim)).enumerate().for_each_init(
+                || vec![0.0f32; ROWS * dim],
+                |h, (block, (q, x))| {
+                    let rows = x.len() / dim;
+                    for (x, h) in x.chunks(dim).zip(h.chunks_mut(dim)) {
+                        rms_row(x, h);
+                    }
+                    gemm::linear_block(h, dim, rows, &self.qkvg, q, width, Act::None, false, None);
+                    for (i, r) in q.chunks_mut(width).enumerate() {
+                        let p = position(block * ROWS + i);
+                        for part in 0..2 {
+                            for head in 0..heads {
+                                rope.apply(&mut r[part * dim + head * hd..][..hd], p);
+                            }
+                        }
+                    }
+                },
+            );
         });
-        qkvg
     }
 
     /// The attention's output projection and the feed-forward block, residual, on `n` tokens.
     fn finish(&self, x: &mut [f32], y: &[f32], n: usize) {
         let dim = self.out.n;
-        let o = profile::time("chord linear", || lin(y, n, &self.out, Act::None));
-        x.par_iter_mut().zip(&o).for_each(|(x, o)| *x += o);
-        let h = rms(x, dim);
-        let f = profile::time("chord linear", || lin(&h, n, &self.ff1, Act::Gelu));
-        let o = profile::time("chord linear", || lin(&f, n, &self.ff2, Act::None));
-        x.par_iter_mut().zip(&o).for_each(|(x, o)| *x += o);
+        let ff = self.ff1.n;
+        profile::time("chord ffn", || {
+            x[..n * dim].par_chunks_mut(ROWS * dim).zip(y[..n * dim].par_chunks(ROWS * dim)).for_each_init(
+                || (vec![0.0f32; ROWS * dim], vec![0.0f32; ROWS * ff]),
+                |(h, f), (x, y)| {
+                    let rows = x.len() / dim;
+                    gemm::linear_block(y, dim, rows, &self.out, x, dim, Act::None, true, None);
+                    for (x, h) in x.chunks(dim).zip(h.chunks_mut(dim)) {
+                        rms_row(x, h);
+                    }
+                    gemm::linear_block(h, dim, rows, &self.ff1, f, ff, Act::Gelu, false, None);
+                    gemm::linear_block(f, ff, rows, &self.ff2, x, dim, Act::None, true, None);
+                },
+            );
+        });
     }
 }
 
 /// Gated attention per sequence and head over `qkvg` rows (`[tokens, 3 * dim + heads]`, q pre-scaled): the queries at
 /// `queries` of each sequence attend to all `len` tokens; `token(s, p)` is the token at position p of sequence s.
-/// Returns `[tokens, dim]` (rows of other tokens left at 0), each head's output times its sigmoid gate.
+/// Writes the queries' rows of `y` `[tokens, dim]` (other rows left as they are), each head's output times its
+/// sigmoid gate; `qkvg` rows are `width` apart.
 #[allow(clippy::too_many_arguments)]
 fn attention(
     qkvg: &[f32],
+    width: usize,
     dim: usize,
     heads: usize,
     seqs: usize,
     len: usize,
     token: impl Fn(usize, usize) -> usize + Sync,
     queries: std::ops::Range<usize>,
-    tokens: usize,
-) -> Vec<f32> {
-    let width = qkvg.len() / tokens;
+    y: &mut [f32],
+) {
     let hd = dim / heads;
     let padded = len.div_ceil(8) * 8;
-    let mut y = vec![0.0f32; tokens * dim];
     let y_ptr = y.as_mut_ptr() as usize;
     profile::time("chord attention", || {
         (0..seqs * heads).into_par_iter().for_each_init(
@@ -278,7 +327,6 @@ fn attention(
             },
         );
     });
-    y
 }
 
 /// `softmax(q k^T) v` for one sequence and head: `q` `[queries, hd]`, `kt` `[hd, padded]` (keys transposed, zero
@@ -559,12 +607,13 @@ impl ChordNet {
         // the time attention among them
         let c = profile::time("chord layers", || {
             let last = self.rows.len() - 1;
+            let mut s = Scratch::default();
             for (r, t) in self.rows[..last].iter().zip(&self.times) {
-                r.forward(&mut x, steps, row, self.heads, true, &rope);
-                t.forward(&mut x, steps, row, self.heads, false, &rope);
+                r.forward(&mut x, steps, row, self.heads, true, &rope, &mut s);
+                t.forward(&mut x, steps, row, self.heads, false, &rope, &mut s);
             }
-            let mut c = self.rows[last].forward_tail(&x, steps, row, self.heads, &rope, row - chords);
-            self.times[last].forward(&mut c, steps, chords, self.heads, false, &rope);
+            let mut c = self.rows[last].forward_tail(&x, steps, row, self.heads, &rope, row - chords, &mut s);
+            self.times[last].forward(&mut c, steps, chords, self.heads, false, &rope, &mut s);
             c
         });
         drop(x);
