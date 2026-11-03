@@ -301,28 +301,56 @@ fn attention(
     let hd = dim / heads;
     let padded = len.div_ceil(8) * 8;
     let y_ptr = y.as_mut_ptr() as usize;
+    let nq = queries.len();
+    // a job per sequence and group of heads: all heads when there are sequences enough for the threads, so each
+    // token's q / k / v row is read once and whole (the time axis's tokens lie a row of tokens apart)
+    let group = if seqs >= 2 * rayon::current_num_threads() { heads } else { 1 };
+    let groups = heads / group;
+    let gw = group * hd;
     profile::time("chord attention", || {
-        (0..seqs * heads).into_par_iter().for_each_init(
-            || (vec![0.0f32; queries.len() * hd], vec![0.0f32; hd * padded], vec![0.0f32; len * hd], vec![0.0f32; queries.len() * hd], vec![0.0f32; 4 * padded]),
-            |(q, kt, v, o, scores), job| {
-                let (s, head) = (job / heads, job % heads);
+        (0..seqs * groups).into_par_iter().for_each_init(
+            || {
+                (
+                    vec![0.0f32; len * gw],     // k rows of the group's heads
+                    vec![0.0f32; len * gw],     // v rows
+                    vec![0.0f32; nq * gw],      // q rows
+                    vec![0.0f32; hd * padded],  // one head's keys, transposed
+                    vec![0.0f32; len * hd],     // one head's values
+                    vec![0.0f32; nq * hd],      // one head's queries
+                    vec![0.0f32; nq * hd],      // its outputs
+                    vec![0.0f32; 4 * padded],   // scores
+                )
+            },
+            |(ks, vs, qs, kt, v, q, o, scores), job| {
+                let (s, h0) = (job / groups, (job % groups) * group);
                 for p in 0..len {
                     let r = &qkvg[token(s, p) * width..];
-                    for d in 0..hd {
-                        kt[d * padded + p] = r[dim + head * hd + d];
+                    ks[p * gw..(p + 1) * gw].copy_from_slice(&r[dim + h0 * hd..][..gw]);
+                    vs[p * gw..(p + 1) * gw].copy_from_slice(&r[2 * dim + h0 * hd..][..gw]);
+                }
+                for (i, p) in queries.clone().enumerate() {
+                    qs[i * gw..(i + 1) * gw].copy_from_slice(&qkvg[token(s, p) * width + h0 * hd..][..gw]);
+                }
+                for g in 0..group {
+                    let head = h0 + g;
+                    for p in 0..len {
+                        let k = &ks[p * gw + g * hd..][..hd];
+                        for (d, &kv) in k.iter().enumerate() {
+                            kt[d * padded + p] = kv;
+                        }
+                        v[p * hd..(p + 1) * hd].copy_from_slice(&vs[p * gw + g * hd..][..hd]);
                     }
-                    v[p * hd..(p + 1) * hd].copy_from_slice(&r[2 * dim + head * hd..][..hd]);
-                }
-                for (i, p) in queries.clone().enumerate() {
-                    q[i * hd..(i + 1) * hd].copy_from_slice(&qkvg[token(s, p) * width + head * hd..][..hd]);
-                }
-                attend(q, kt, v, len, padded, hd, o, scores);
-                for (i, p) in queries.clone().enumerate() {
-                    let t = token(s, p);
-                    let gate = 1.0 / (1.0 + (-qkvg[t * width + 3 * dim + head]).exp());
-                    // each (token, head) slice is written by one job only
-                    let out = unsafe { std::slice::from_raw_parts_mut((y_ptr as *mut f32).add(t * dim + head * hd), hd) };
-                    out.iter_mut().zip(&o[i * hd..(i + 1) * hd]).for_each(|(out, v)| *out = v * gate);
+                    for i in 0..nq {
+                        q[i * hd..(i + 1) * hd].copy_from_slice(&qs[i * gw + g * hd..][..hd]);
+                    }
+                    attend(q, kt, v, len, padded, hd, o, scores);
+                    for (i, p) in queries.clone().enumerate() {
+                        let t = token(s, p);
+                        let gate = 1.0 / (1.0 + (-qkvg[t * width + 3 * dim + head]).exp());
+                        // each (token, head) slice is written by one job only
+                        let out = unsafe { std::slice::from_raw_parts_mut((y_ptr as *mut f32).add(t * dim + head * hd), hd) };
+                        out.iter_mut().zip(&o[i * hd..(i + 1) * hd]).for_each(|(out, v)| *out = v * gate);
+                    }
                 }
             },
         );

@@ -30,6 +30,8 @@ pub struct ConvWeights {
     int16: Option<(Vec<i16>, Vec<f32>)>,
     /// 3 x 3, stride 1: Winograd's F(2 x 2, 3 x 3) (`crate::winograd`).
     winograd: Option<crate::winograd::Winograd>,
+    /// 5 x 5, stride 1: F(2 x 2, 5 x 5) (`crate::winograd5`).
+    winograd5: Option<crate::winograd5::Winograd5>,
 }
 
 impl ConvWeights {
@@ -40,7 +42,12 @@ impl ConvWeights {
         } else {
             None
         };
-        Self { lin, kernel, stride, channels, int16: None, winograd }
+        let winograd5 = if kernel == 5 && stride == (1, 1) {
+            crate::winograd5::Winograd5::new(&lin, channels)
+        } else {
+            None
+        };
+        Self { lin, kernel, stride, channels, int16: None, winograd, winograd5 }
     }
 
     fn padded_channels(&self) -> usize {
@@ -52,6 +59,7 @@ impl ConvWeights {
         if let Some(w) = &mut self.winograd {
             w.quantize();
         }
+        // Winograd5's products stay float32 (see there)
         let lin = &self.lin;
         let (taps, c, cp) = (self.kernel * self.kernel, self.channels, self.padded_channels());
         assert!(cp <= q16::KC, "conv: more channels than a slice of k");
@@ -85,6 +93,9 @@ impl ConvWeights {
     /// without it).
     pub fn forward(&self, x: &[f32], h: usize, w: usize, act: Act) -> Option<(Vec<f32>, usize, usize)> {
         if let Some(wino) = &self.winograd {
+            return Some((wino.forward(x, h, w, act), h, w));
+        }
+        if let Some(wino) = &self.winograd5 {
             return Some((wino.forward(x, h, w, act), h, w));
         }
         self.forward_direct(x, h, w, act)
