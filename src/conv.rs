@@ -28,12 +28,19 @@ pub struct ConvWeights {
     pub stride: (usize, usize),
     pub channels: usize,
     int16: Option<(Vec<i16>, Vec<f32>)>,
+    /// 3 x 3, stride 1: Winograd's F(2 x 2, 3 x 3) (`crate::winograd`).
+    winograd: Option<crate::winograd::Winograd>,
 }
 
 impl ConvWeights {
     pub fn new(lin: Linear, kernel: usize, stride: (usize, usize)) -> Self {
         let channels = lin.k / (kernel * kernel);
-        Self { lin, kernel, stride, channels, int16: None }
+        let winograd = if kernel == 3 && stride == (1, 1) {
+            crate::winograd::Winograd::new(&lin, channels)
+        } else {
+            None
+        };
+        Self { lin, kernel, stride, channels, int16: None, winograd }
     }
 
     fn padded_channels(&self) -> usize {
@@ -42,6 +49,9 @@ impl ConvWeights {
 
     /// Round the weights to int16, 12 bits per output channel.
     pub fn quantize(&mut self) {
+        if let Some(w) = &mut self.winograd {
+            w.quantize();
+        }
         let lin = &self.lin;
         let (taps, c, cp) = (self.kernel * self.kernel, self.channels, self.padded_channels());
         assert!(cp <= q16::KC, "conv: more channels than a slice of k");
@@ -74,6 +84,14 @@ impl ConvWeights {
     /// `[h, w, c]` -> `[h', w', out]` (zero padding `kernel / 2`), then the bias and `act`.  AVX2 only (`None`
     /// without it).
     pub fn forward(&self, x: &[f32], h: usize, w: usize, act: Act) -> Option<(Vec<f32>, usize, usize)> {
+        if let Some(wino) = &self.winograd {
+            return Some((wino.forward(x, h, w, act), h, w));
+        }
+        self.forward_direct(x, h, w, act)
+    }
+
+    /// `forward` without Winograd's transform.
+    pub fn forward_direct(&self, x: &[f32], h: usize, w: usize, act: Act) -> Option<(Vec<f32>, usize, usize)> {
         #[cfg(target_arch = "x86_64")]
         if crate::simd::avx2() && (self.int16.is_some() || matches!(self.lin.w, Panels::F32(_))) {
             return Some(self.forward_avx2(x, h, w, act));

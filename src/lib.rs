@@ -21,6 +21,7 @@ pub mod q16;
 pub mod simd;
 pub mod tracker;
 pub mod weights;
+pub mod winograd;
 
 use bars::BarModel;
 use encoder::{Encoder, Mix, N_FFT, SAMPLE_RATE, SAMPLES_PER_FRAME, WIDTH};

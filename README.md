@@ -127,10 +127,13 @@ within 2e-5. Its speed has to be measured on the GPU it runs on:
   whole window).
 * The heads (`src/heads.rs`) run their GRU on 60 s pieces with 15 s of context, as `heads.CHUNK`, in parallel.
 * The chord model (`src/chords/`) runs as `tsumugi_chords.note_chords.song_logits`: 30 s windows keeping their middle
-  20 s; the recursive CQT with its kernels from the export, the stem's convolutions as linear layers over patches
-  (channels last), the axis Transformer with RMSNorm scales and attention's scale folded into the next layers.
-  The last layer runs only for what the chord queries read (their row attention, then their time attention), and
-  attention is an AVX2 kernel over 4 queries at a time. The decoder (`semi_crf.decode`, `chords.segments`) is ported
+  20 s; the recursive CQT with its kernels from the export, the stem's convolutions (channels last) read straight
+  from the padded input a tap at a time (`src/conv.rs`), the 3 x 3 stride-1 ones by Winograd's F(2 x 2, 3 x 3)
+  (`src/winograd.rs`: 2.25 times fewer multiply-adds, two rows of tiles per task so the transformed tiles and
+  products stay in cache), the axis Transformer with RMSNorm scales and attention's scale folded into the next
+  layers, each block's norms, products and residuals run 96 tokens per task. The last layer runs only for what the
+  chord queries read (their row attention, then their time attention), and attention is an AVX2 kernel over 4
+  queries at a time. The decoder (`semi_crf.decode`, `chords.segments`) is ported
   line by line with its tables from the export.
 * The trackers (`src/tracker.rs`, `src/melody.rs`) are `bar_tracker.py` and `melody.py`'s `line_notes` / `notes`
   line by line, the beat tracker's interval transitions as AVX2 max-plus products.
