@@ -111,8 +111,8 @@ impl Model {
             return Err("int16 is for the CPU only".into());
         }
         if simd::avx2() {
-            // the attention core on int16 too: being evaluated, opt-in for now
-            self.encoder.int16_attention = std::env::var("TSUMUGI_INT16_ATTENTION").is_ok_and(|v| v == "1");
+            // the attention core on int16 too (`TSUMUGI_INT16_ATTENTION=0` keeps it float32)
+            self.encoder.int16_attention = std::env::var("TSUMUGI_INT16_ATTENTION").map_or(true, |v| v != "0");
             if self.encoder.quantize() {
                 // the encoder's float16 pages are not read again; the heads' tensors come back from the page cache
                 self.weights.release_pages();

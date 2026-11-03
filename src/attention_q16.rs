@@ -100,7 +100,7 @@ impl SendPtr {
 pub fn attend(qo: &mut [f32], quant: &Quantized, frames: usize) {
     const QB: usize = 16 * MR;
     const KB: usize = 256; // a multiple of FLUSH_KEYS
-    const _: () = assert!(KB % FLUSH_KEYS == 0);
+    const _: () = assert!(KB.is_multiple_of(FLUSH_KEYS));
     assert!(qo.len() >= (frames + MR) * WIDTH);
     let (padded, vkeys) = (quant.padded, quant.vkeys);
     let blocks = frames.div_ceil(QB);
@@ -118,10 +118,10 @@ pub fn attend(qo: &mut [f32], quant: &Quantized, frames: usize) {
         // the task's q rows as int16 pairs, `[row panel][32 pairs][MR]`, read before any output is written
         let mut qpack = vec![0i32; row_panels * KEY_PAIRS * MR];
         let mut qscale = vec![0.0f32; row_panels * MR];
-        for r in 0..rows {
+        for (r, s) in qscale.iter_mut().take(rows).enumerate() {
             let q = unsafe { std::slice::from_raw_parts(out_ptr.get().add((q0 + r) * WIDTH + head * HEAD_DIM), HEAD_DIM) };
             let rp = r / MR;
-            qscale[r] = q16::quantize_row(q, None, &mut qpack[rp * KEY_PAIRS * MR..(rp + 1) * KEY_PAIRS * MR], r % MR);
+            *s = q16::quantize_row(q, None, &mut qpack[rp * KEY_PAIRS * MR..(rp + 1) * KEY_PAIRS * MR], r % MR);
         }
         let mut scores = vec![0.0f32; row_panels * MR * KB];
         let mut ppack = vec![0i32; row_panels * (KB / 2) * MR];
@@ -203,7 +203,7 @@ pub fn attend(qo: &mut [f32], quant: &Quantized, frames: usize) {
 /// `row` (`kb` probabilities, at most 1) times `PROB_MAX` as int16 pairs at `dst[p * MR + ri]` for `pairs` pairs (zero
 /// past the row); returns their sum.
 fn pack_probs(row: &[f32], pairs: usize, dst: &mut [i32], ri: usize) -> i64 {
-    assert!(dst.len() >= (pairs - 1) * MR + ri + 1 && 2 * pairs >= row.len());
+    assert!(dst.len() > (pairs - 1) * MR + ri && 2 * pairs >= row.len());
     #[cfg(target_arch = "x86_64")]
     if crate::simd::avx2() {
         return unsafe { pack_probs_avx2(row, pairs, dst, ri) };

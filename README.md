@@ -30,13 +30,16 @@ reads the song in stereo at 25.6 kHz with the beats, downbeats and keys of the s
 or not `key` is in `--heads`). Export both files from the versions that go together: Tsumugi-Chords' `config.json`
 names the SheetSage2-Refined revision it was trained with (`beats_keys`, v0.5.0 for the first release).
 
-`--precision int16` runs the encoder's linear layers and the chord model's linear layers and convolutions on int16
-values (`vpmaddwd`, twice the multiply-adds of a float32 FMA per instruction; for AVX2 CPUs without AVX-VNNI):
-the weights are rounded at load to 12 bits per output channel, the activations to 13 bits per row and 256 values
-of k (the convolutions: per map). On synthetic test songs (60 s, 100 s, 330 s) the outputs equal float32's except
-for a few beats a couple of milliseconds apart and one chord quality of 137 in the 330 s song. The int16 weights
-are a copy on the heap (about 1.1 GB more memory than float32, whose pages are mapped from the file; see
-`--save-int16` below). Whether it pays depends on the CPU: time both on yours.
+`--precision int16` runs the encoder's linear layers and attention core and the chord model's linear layers and
+convolutions on int16 values (`vpmaddwd`, twice the multiply-adds of a float32 FMA per instruction; for AVX2 CPUs
+without AVX-VNNI): the weights are rounded at load to 12 bits per output channel, the activations to 13 bits per row
+and 256 values of k (the convolutions: per map); in attention q to 13 bits per row, each key to 12 bits, the
+probabilities to 15 bits and the values to 10 bits per dimension (`src/attention_q16.rs`; `TSUMUGI_INT16_ATTENTION=0`
+keeps it float32). The chord stem's 5 x 5 convolution stays float32 (its Winograd transform widens the range). On
+synthetic test songs (100 s, 240 s, 330 s) against float32: beats and note boundaries within a few milliseconds (one
+note boundary a 25 Hz frame apart in the 330 s song), the same notes, keys and section labels, and one chord quality
+of 137 in the 330 s song. The int16 weights are a copy on the heap (about 1.1 GB more memory than float32, whose
+pages are mapped from the file; see `--save-int16` below). Whether it pays depends on the CPU: time both on yours.
 
 ```bash
 ./target/release/tsumugi-engine --weights cpu.safetensors --save-int16 cpu.int16.safetensors
