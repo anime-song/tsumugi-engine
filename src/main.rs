@@ -21,7 +21,7 @@ use tsumugi_engine::{Frames, MemoryWatch, Model, Outputs, Result, audio, bars, e
 fn usage() -> ! {
     eprintln!(
         "usage: tsumugi-engine --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--device cpu|gpu] [--logits] \
-         [--cpu-heads N] [--tempo-weight W] [--hold P] AUDIO..."
+         [--cpu-heads N] [--tempo-weight W] [--hold P] [--chords FILE] [--precision f32|int16] AUDIO..."
     );
     std::process::exit(2)
 }
@@ -115,10 +115,12 @@ fn main() -> Result<()> {
     let mut adapter = None;
     let mut cpu_heads = 0usize;
     let mut chords_file = None;
+    let mut precision = "f32".to_string();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--weights" => weights = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--chords" => chords_file = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--precision" => precision = args.next().unwrap_or_else(|| usage()),
             "--adapter" => adapter = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--threads" => threads = Some(args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| usage())),
             "--out-dir" => out_dir = PathBuf::from(args.next().unwrap_or_else(|| usage())),
@@ -145,7 +147,12 @@ fn main() -> Result<()> {
     if chords_file.is_some() && !load.contains(&"key") {
         load.push("key");
     }
-    let chords = chords_file.as_deref().map(Chords::load).transpose()?;
+    let int16 = match precision.as_str() {
+        "f32" => false,
+        "int16" => true,
+        _ => usage(),
+    };
+    let chords = chords_file.as_deref().map(|p| Chords::load(p, int16)).transpose()?;
     let mut model = match device.as_str() {
         "cpu" => Model::load(&weights, &load)?,
         #[cfg(feature = "gpu")]

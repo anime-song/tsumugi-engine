@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod bars;
 pub mod chords;
+pub mod conv;
 pub mod encoder;
 pub mod gemm;
 #[cfg(feature = "gpu")]
@@ -16,6 +17,7 @@ pub mod math;
 pub mod melody;
 pub mod post;
 pub mod profile;
+pub mod q16;
 pub mod simd;
 pub mod tracker;
 pub mod weights;

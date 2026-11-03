@@ -308,6 +308,7 @@ impl GpuEncoder {
         let half: Vec<u16> = match &lin.w {
             Panels::F16(w) => w.to_vec(),
             Panels::F32(w) => w.iter().map(|&v| f16_bits(v)).collect(),
+            Panels::Q16(_) => return Err(format!("{name}: int16 weights are for the CPU only").into()),
             Panels::I8(w) => {
                 let scale = lin.scale.ok_or("int8 weights without scales")?;
                 w.iter()

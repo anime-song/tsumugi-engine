@@ -58,6 +58,9 @@ pub enum Panels {
     F32(Floats),
     F16(Shared<u16>),
     I8(&'static [i8]),
+    /// Quantised on the CPU at load (`gemm::quantize`): `[ceil(n / 16), ceil(k / 2), 16, 2]`, pairs of k per column
+    /// for `vpmaddwd`, with a scale per output channel.
+    Q16(Arc<[i16]>),
 }
 
 /// A linear layer `y = W x + b`, `W` `[n, k]` stored as panels `[ceil(n / 16), k, 16]`; int8 weights carry a scale

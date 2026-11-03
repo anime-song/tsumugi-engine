@@ -7,6 +7,7 @@
 use rayon::prelude::*;
 
 use super::frontend::Frontend;
+use crate::conv::ConvWeights;
 use crate::Result;
 use crate::gemm::{self, Act};
 use crate::math;
@@ -16,36 +17,52 @@ use crate::weights::{Linear, Weights};
 pub const BEAT_FEATURES: usize = 11;
 pub const KEY_FEATURES: usize = 25;
 
+/// A linear layer of the file, rounded to int16 if `int16` (`crate::q16`).
+fn load_linear(w: &Weights, name: &str, int16: bool) -> Result<Linear> {
+    let l = w.linear(name)?;
+    Ok(if int16 && crate::simd::avx2() { crate::q16::quantize(&l) } else { l })
+}
+
 fn lin(x: &[f32], m: usize, l: &Linear, act: Act) -> Vec<f32> {
     let mut out = vec![0.0f32; m * l.n];
     gemm::linear(x, l.k, m, l, &mut out, l.n, act, false, None);
     out
 }
 
-/// A 2-D convolution on a channels-last map `[h, w, c]` as a linear layer over patches (`[out, kh, kw, c]`).
+/// A 2-D convolution on a channels-last map `[h, w, c]` (`crate::conv`; without AVX2 as a linear layer over patches
+/// `[out, kh, kw, c]`).
 struct Conv {
-    lin: Linear,
-    kernel: usize,
-    stride: (usize, usize),
+    name: &'static str, // for the profile
+    w: ConvWeights,
 }
 
 impl Conv {
-    fn load(w: &Weights, name: &str, kernel: usize, stride: (usize, usize)) -> Result<Self> {
-        Ok(Self { lin: w.linear(name)?, kernel, stride })
+    fn load(w: &Weights, name: &str, kernel: usize, stride: (usize, usize), int16: bool) -> Result<Self> {
+        let mut conv = ConvWeights::new(w.linear(name)?, kernel, stride);
+        if int16 && crate::simd::avx2() {
+            conv.quantize();
+        }
+        let label = format!("conv {}", name.trim_end_matches(".conv").trim_start_matches("stem."));
+        Ok(Self { name: Box::leak(label.into_boxed_str()), w: conv })
     }
 
     /// `[h, w, c]` -> `[h', w', out]` (padding `kernel / 2`).
     fn forward(&self, x: &[f32], h: usize, w: usize, act: Act) -> (Vec<f32>, usize, usize) {
-        let k = self.kernel;
-        let c = self.lin.k / (k * k);
+        profile::time(self.name, || self.w.forward(x, h, w, act).unwrap_or_else(|| self.patches(x, h, w, act)))
+    }
+
+    fn patches(&self, x: &[f32], h: usize, w: usize, act: Act) -> (Vec<f32>, usize, usize) {
+        let lin = &self.w.lin;
+        let k = self.w.kernel;
+        let c = lin.k / (k * k);
         let pad = k / 2;
-        let (sh, sw) = self.stride;
+        let (sh, sw) = self.w.stride;
         let (ho, wo) = ((h + 2 * pad - k) / sh + 1, (w + 2 * pad - k) / sw + 1);
-        let n = self.lin.n;
+        let n = lin.n;
         let mut out = vec![0.0f32; ho * wo * n];
         out.par_chunks_mut(wo * n).enumerate().for_each(|(row, out)| {
-            let mut patches = vec![0.0f32; wo * self.lin.k];
-            for (col, patch) in patches.chunks_mut(self.lin.k).enumerate() {
+            let mut patches = vec![0.0f32; wo * lin.k];
+            for (col, patch) in patches.chunks_mut(lin.k).enumerate() {
                 for dy in 0..k {
                     let y = (row * sh + dy) as isize - pad as isize;
                     for dx in 0..k {
@@ -59,7 +76,7 @@ impl Conv {
                     }
                 }
             }
-            gemm::linear_block(&patches, self.lin.k, wo, &self.lin, out, n, act, false, None);
+            gemm::linear_block(&patches, lin.k, wo, lin, out, n, act, false, None);
         });
         (out, ho, wo)
     }
@@ -145,12 +162,13 @@ fn rms(x: &[f32], dim: usize) -> Vec<f32> {
 }
 
 impl Block {
-    fn load(w: &Weights, name: &str) -> Result<Self> {
+    fn load(w: &Weights, name: &str, int16: bool) -> Result<Self> {
+        let l = |part: &str| load_linear(w, &format!("{name}.{part}"), int16);
         Ok(Self {
-            qkvg: w.linear(&format!("{name}.qkvg"))?,
-            out: w.linear(&format!("{name}.out"))?,
-            ff1: w.linear(&format!("{name}.ff1"))?,
-            ff2: w.linear(&format!("{name}.ff2"))?,
+            qkvg: l("qkvg")?,
+            out: l("out")?,
+            ff1: l("ff1")?,
+            ff2: l("ff2")?,
         })
     }
 
@@ -420,14 +438,15 @@ pub struct ChordNet {
 pub const OUTPUT: usize = 13 + 745 + 1;
 
 impl ChordNet {
-    pub fn load(w: &Weights) -> Result<Self> {
+    /// `int16`: the linear layers and convolutions on int16 values (`crate::q16`), else float32.
+    pub fn load(w: &Weights, int16: bool) -> Result<Self> {
         let config: serde_json::Value = serde_json::from_str(w.metadata.get("config").map_or("{}", |s| s))?;
         let get = |k: &str| config[k].as_u64().map(|v| v as usize).ok_or_else(|| format!("chords: no {k}"));
         let blocks = [("block1", (2, 1), true), ("block2", (2, 2), true), ("block3", (2, 2), true), ("block4", (1, 1), false)]
             .into_iter()
             .map(|(name, stride, gelu)| {
                 Ok((
-                    Conv::load(w, &format!("stem.{name}.conv"), 3, stride)?,
+                    Conv::load(w, &format!("stem.{name}.conv"), 3, stride, int16)?,
                     GroupNorm::load(w, &format!("stem.{name}.norm"), 4)?,
                     gelu,
                 ))
@@ -438,7 +457,7 @@ impl ChordNet {
                 let part = |j: usize| -> Result<(GroupNorm, Conv)> {
                     Ok((
                         GroupNorm::load(w, &format!("extra.{i}.norm{j}"), 8)?,
-                        Conv::load(w, &format!("extra.{i}.conv{j}"), 3, (1, 1))?,
+                        Conv::load(w, &format!("extra.{i}.conv{j}"), 3, (1, 1), int16)?,
                     ))
                 };
                 Ok([part(1)?, part(2)?])
@@ -446,14 +465,14 @@ impl ChordNet {
             .collect::<Result<Vec<_>>>()?;
         let layers = get("layers")?;
         let load_blocks =
-            |kind: &str| (0..layers).map(|i| Block::load(w, &format!("{kind}.{i}"))).collect::<Result<Vec<_>>>();
+            |kind: &str| (0..layers).map(|i| Block::load(w, &format!("{kind}.{i}"), int16)).collect::<Result<Vec<_>>>();
         if get("chords")? < 2 {
             return Err("chords: a model with one chord query is not supported".into());
         }
         Ok(Self {
             frontend: Frontend::load(w, &config)?,
-            conv1: Conv::load(w, "stem.conv1", 7, (1, 1))?,
-            conv2: Conv::load(w, "stem.conv2", 5, (1, 1))?,
+            conv1: Conv::load(w, "stem.conv1", 7, (1, 1), int16)?,
+            conv2: Conv::load(w, "stem.conv2", 5, (1, 1), int16)?,
             freq_embed: w.f32("stem.freq_embed")?,
             blocks,
             extra,
@@ -464,10 +483,10 @@ impl ChordNet {
             beat_in: w.linear("tokens.beat_in")?,
             rows: load_blocks("row")?,
             times: load_blocks("time")?,
-            merge: w.linear("merge")?,
-            up: w.linear("up")?,
-            adapter: (w.linear("adapter.1")?, w.linear("adapter.2")?),
-            out: w.linear("out")?,
+            merge: load_linear(w, "merge", int16)?,
+            up: load_linear(w, "up", int16)?,
+            adapter: (load_linear(w, "adapter.1", int16)?, load_linear(w, "adapter.2", int16)?),
+            out: load_linear(w, "out", int16)?,
             dim: get("dim")?,
             heads: get("heads")?,
             rate: get("rate")?,
@@ -477,7 +496,7 @@ impl ChordNet {
     /// The stem's output `[steps, bands, dim]` for the frontend's `[frames, bins, channels]`.
     pub fn stem(&self, spec: &[f32], frames: usize, bins: usize) -> (Vec<f32>, usize, usize) {
         let (mut x, h, w) = self.conv1.forward(spec, frames, bins, Act::None);
-        let c = self.conv1.lin.n;
+        let c = self.conv1.w.lin.n;
         x.par_chunks_mut(w * c).for_each(|row| {
             for (col, v) in row.chunks_mut(c).enumerate() {
                 v.iter_mut().zip(&self.freq_embed[col * c..(col + 1) * c]).for_each(|(v, e)| *v += e);

@@ -41,9 +41,10 @@ pub struct Probs {
 }
 
 impl Chords {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `int16`: the model's matrix products on int16 values (`crate::q16`), else float32.
+    pub fn load(path: &Path, int16: bool) -> Result<Self> {
         let weights = Weights::open_format(path, FORMAT, "python/export_chords.py")?;
-        Ok(Self { net: ChordNet::load(&weights)?, decoder: decode::Decoder::load(&weights)?, weights })
+        Ok(Self { net: ChordNet::load(&weights, int16)?, decoder: decode::Decoder::load(&weights)?, weights })
     }
 
     /// `tsumugi_chords.note_chords.song_logits`: the 25 Hz probabilities over a stereo song at the model's rate.

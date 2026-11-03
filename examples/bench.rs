@@ -33,13 +33,13 @@ fn main() {
         println!("kernel in cache, {t} threads: {:.1} GFLOP/s", flops / start.elapsed().as_secs_f64() / 1e9);
     }
     let m = 2500;
-    let shapes = [(4096, 1024), (1024, 4096), (3072, 1024)];
+    let shapes = [(4096, 1024), (1024, 4096), (3072, 1024), (776, 256), (1024, 256), (256, 1024), (64, 1600)];
     let layers: Vec<Linear> = shapes
         .iter()
         .map(|&(n, k)| Linear {
             n,
             k,
-            w: Panels::F16(leak(vec![half::f16::from_f32(0.01).to_bits(); n * k]).into()),
+            w: Panels::F16(leak(vec![half::f16::from_f32(0.01).to_bits(); n.div_ceil(NR) * NR * k]).into()),
             scale: None,
             bias: leak(vec![0.0; n]).into(),
             lora: None,
@@ -53,7 +53,7 @@ fn main() {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let start = Instant::now();
-            gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, Act::Gelu, false, None);
+            gemm::linear(&x, lin.k, m, lin, &mut out, lin.n, if std::env::var_os("BENCH_NOACT").is_some() { Act::None } else { Act::Gelu }, false, None);
             best = best.min(start.elapsed().as_secs_f64());
         }
         2.0 * (m * lin.n * lin.k) as f64 / best / 1e9
@@ -73,7 +73,9 @@ fn main() {
         println!("best: SHEETSAGE_ROWS={} SHEETSAGE_KC={} ({:.1} GFLOP/s)", best.1, best.2, best.0);
     } else {
         for lin in &layers {
-            println!("linear {m}x{} -> {} (f16): {:.1} GFLOP/s", lin.k, lin.n, run(lin));
+            let f16 = run(lin);
+            let q = tsumugi_engine::q16::quantize(lin);
+            println!("linear {m}x{} -> {}: f16 {f16:.1} GFLOP/s, int16 {:.1} GFLOP/s", lin.k, lin.n, run(&q));
         }
     }
 }

@@ -10,7 +10,7 @@ use tsumugi_engine::chords::{Chords, Info};
 
 fn main() -> tsumugi_engine::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let model = Chords::load(args[0].as_ref())?;
+    let model = Chords::load(args[0].as_ref(), std::env::var("TSUMUGI_INT16").is_ok_and(|v| v == "1"))?;
     let bytes = std::fs::read(&args[1])?;
     let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     let n = samples.len() / 2;

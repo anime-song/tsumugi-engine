@@ -132,6 +132,9 @@ fn product(
     accumulate: bool,
     a_scale: Option<&[f32]>,
 ) {
+    if let Panels::Q16(w) = &lin.w {
+        return crate::q16::product(a, lda, m, lin, w, out, ldo, act, accumulate, a_scale);
+    }
     SCRATCH.with(|s| {
         let (apack, bpanel) = &mut *s.borrow_mut();
         let row_panels = m.div_ceil(MR);
@@ -178,7 +181,7 @@ fn product(
 }
 
 #[inline]
-fn epilogue(o: &mut [f32], t: &[f32], bias: &[f32], overwrite: bool, last: bool, act: Act) {
+pub(crate) fn epilogue(o: &mut [f32], t: &[f32], bias: &[f32], overwrite: bool, last: bool, act: Act) {
     for j in 0..o.len() {
         let mut v = t[j];
         if !overwrite {
@@ -325,6 +328,7 @@ fn panel_slice<'a>(lin: &'a Linear, panel: usize, k0: usize, kc: usize, buf: &'a
             }
             (&buf[..kc * NR], NR)
         }
+        Panels::Q16(_) => unreachable!("int16 panels go through product_q16"),
     }
 }
 
@@ -460,6 +464,7 @@ unsafe fn kernel_avx2(
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
