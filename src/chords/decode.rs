@@ -1,10 +1,11 @@
-//! Tsumugi-Chords' decoder (`tsumugi_chords.decode.ChordDecoder`): the semi-Markov search over candidate boundaries
-//! on the beat grid (`semi_crf.decode`, see there for the scores), one quality per segment (`chords.segments`) and
-//! the mir_eval labels.
+//! Tsumugi-Chords' decoder (`tsumugi_chords.decode.ChordDecoder`): repeated bars mixed (`repeat.smooth`), the
+//! semi-Markov search over candidate boundaries on the beat grid (`semi_crf.decode`, see there for the scores), one
+//! quality per segment (`chords.segments`), the merges after the search (`chords.merge_*`), and the mir_eval labels
+//! and chord symbols.
 
 use serde_json::Value;
 
-use super::{FRAME_RATE, Info, Probs, parent_tonic};
+use super::{FRAME_RATE, Info, Probs, decoder_parent, parent_tonic};
 use crate::Result;
 use crate::weights::Weights;
 
@@ -28,6 +29,14 @@ struct Params {
     long_beats: f64,
     max_candidates: usize,
     prune: f32,
+    bass_prior: f64,
+    symmetric: bool,
+    merge_fifth_bass: Option<String>, // "first", "longer" or "root"
+    short_slash: f64,
+    repeat_beta: f64,
+    repeat_context: f64,
+    repeat_local: f64,
+    merge_similar: bool,
 }
 
 pub struct Decoder {
@@ -46,6 +55,18 @@ pub struct Decoder {
     dur_edges: Vec<f64>,
     subs: Vec<f64>,
     sub_tolerance: f64,
+    bass_interval: Vec<f64>, // [families, 12]: log P(bass interval | family) over the family's likeliest
+    symmetric: Vec<(usize, usize)>, // (family, the root step that keeps its notes): aug 4, dim7 3
+}
+
+/// A run of the path (`chords.Segment`): frames `[start, end)`, root x quality class (`NO_CHORD` for N), bass (12
+/// for N).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Segment {
+    start: usize,
+    end: usize,
+    detail: usize,
+    bass: usize,
 }
 
 /// A chord of the output: times in seconds, root and bass pitch classes (None for no chord or no separate bass).
@@ -56,6 +77,16 @@ pub struct Chord {
     pub root: Option<usize>,
     pub quality: Option<String>,
     pub bass: Option<usize>,
+    /// The chord symbol spelt in the chord's key, e.g. `Am7/G`.
+    pub symbol: String,
+}
+
+impl Chord {
+    /// As `<song>.chords.json` holds it.
+    pub fn json(&self) -> Value {
+        serde_json::json!({"start": self.start, "end": self.end, "label": self.label, "root": self.root,
+                           "quality": self.quality, "bass": self.bass, "symbol": self.symbol})
+    }
 }
 
 impl Decoder {
@@ -81,12 +112,36 @@ impl Decoder {
             long_beats: f("long_beats")?,
             max_candidates: f("max_candidates")? as usize,
             prune: f("prune")? as f32,
+            // (exports from before Tsumugi-Chords 0.2.0 have none of these: off)
+            bass_prior: p["bass_prior"].as_f64().unwrap_or(0.0),
+            symmetric: p["symmetric"].as_bool().unwrap_or(false),
+            merge_fifth_bass: match &p["merge_fifth_bass"] {
+                Value::Bool(true) => Some("first".into()),
+                Value::String(k) => Some(k.clone()),
+                _ => None,
+            },
+            short_slash: p["short_slash"].as_f64().unwrap_or(0.0),
+            repeat_beta: p["repeat_beta"].as_f64().unwrap_or(0.0),
+            repeat_context: p["repeat_context"].as_f64().unwrap_or(0.9),
+            repeat_local: p["repeat_local"].as_f64().unwrap_or(0.75),
+            merge_similar: p["merge_similar"].as_bool().unwrap_or(false),
         };
+        if params.bass_prior != 0.0 && !w.has("decoder.bass_interval") {
+            return Err("chords decoder: no bass_interval table (export again with python/export_chords.py)".into());
+        }
         let v64 = |name: &str| -> Result<Vec<f64>> { Ok(w.f32(name)?.iter().map(|&v| v as f64).collect()) };
         let strings = |k: &str| -> Vec<String> {
             meta[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default()
         };
         let floats = |k: &str| -> Vec<f64> { meta[k].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default() };
+        let qualities = strings("qualities");
+        let quality_family: Vec<usize> = w.f32("decoder.quality_family")?.iter().map(|&v| v as usize).collect();
+        // `chords.SYMMETRIC`
+        let symmetric = [("aug", 4), ("dim7", 3)]
+            .iter()
+            .filter_map(|&(name, step)| Some((quality_family[qualities.iter().position(|q| q == name)?], step)))
+            .collect();
+        let bass_interval = if w.has("decoder.bass_interval") { v64("decoder.bass_interval")? } else { Vec::new() };
         Ok(Self {
             params,
             dur_chord: v64("decoder.dur_chord")?,
@@ -95,22 +150,32 @@ impl Decoder {
             pos_bass: v64("decoder.pos_bass")?,
             lm: w.f32("decoder.lm")?,
             group: w.f32("decoder.group")?.iter().map(|&v| v as usize).collect(),
-            quality_family: w.f32("decoder.quality_family")?.iter().map(|&v| v as usize).collect(),
+            quality_family,
             tones: w.f32("decoder.tones")?,
             states: meta["states"].as_u64().ok_or("chords decoder: no states")? as usize,
-            qualities: strings("qualities"),
+            qualities,
             labels: strings("labels"),
             dur_edges: floats("dur_edges"),
             subs: floats("subs"),
             sub_tolerance: meta["sub_tolerance"].as_f64().unwrap_or(0.07),
+            bass_interval,
+            symmetric,
         })
     }
 
+    /// `chords.equivalent_roots`: the roots that spell the same notes as `root` in `family`.
+    fn equivalent_roots(&self, family: usize, root: usize) -> Vec<usize> {
+        match self.symmetric.iter().find(|&&(f, _)| f == family) {
+            Some(&(_, step)) => (0..12 / step).map(|k| (root + k * step) % 12).collect(),
+            None => vec![root],
+        }
+    }
+
     /// Root x family probabilities `[frames, states]` (the qualities of a family summed).
-    fn family(&self, p: &Probs) -> Vec<f32> {
+    fn family(&self, detail: &[f32]) -> Vec<f32> {
         let s = self.states;
-        let mut out = vec![0.0f32; p.frames * s];
-        for (o, d) in out.chunks_mut(s).zip(p.detail.chunks(DETAIL)) {
+        let mut out = vec![0.0f32; detail.len() / DETAIL * s];
+        for (o, d) in out.chunks_mut(s).zip(detail.chunks(DETAIL)) {
             for (c, &v) in d.iter().enumerate() {
                 o[self.group[c]] += v;
             }
@@ -118,10 +183,79 @@ impl Decoder {
         out
     }
 
+    /// `chords.merge_symmetric`: each symmetric chord's roots get the sum over the roots that spell its notes.
+    fn merge_symmetric(&self, family: &mut [f32]) {
+        for row in family.chunks_mut(self.states) {
+            for &(fam, step) in &self.symmetric {
+                let cols: [f32; 12] = std::array::from_fn(|r| row[12 * fam + r]);
+                for r in 0..12 {
+                    row[12 * fam + r] = (0..12 / step).fold(0.0, |acc, k| acc + cols[(r + 12 - k * step) % 12]);
+                }
+            }
+        }
+    }
+
     pub fn decode(&self, p: &Probs, info: &Info) -> Vec<Chord> {
-        let family = self.family(p);
-        let (chord_path, bass_path) = self.search(p, &family, info);
-        self.segments(p, &family, &chord_path, &bass_path)
+        let pr = &self.params;
+        let smoothed = if pr.repeat_beta != 0.0 && !info.downbeats.is_empty() {
+            super::repeat::smooth(
+                &p.detail,
+                DETAIL,
+                &p.bass,
+                self.tones,
+                &info.downbeats,
+                pr.repeat_beta,
+                pr.repeat_context,
+                pr.repeat_local,
+            )
+        } else {
+            None
+        };
+        let detail = smoothed.as_deref().unwrap_or(&p.detail);
+        let family = self.family(detail);
+        let mut searched = family.clone();
+        if pr.symmetric {
+            self.merge_symmetric(&mut searched);
+        }
+        let (chord_path, bass_path) = self.search(p, &searched, info);
+        let mut segs = self.segments(detail, &family, &chord_path, &bass_path);
+        if let Some(keep) = &pr.merge_fifth_bass {
+            segs = merge_fifth_bass(&segs, keep);
+        }
+        if pr.short_slash != 0.0 {
+            let beat_of = |f: usize| beat_position(&info.beats, &[f as f64 / FRAME_RATE])[0];
+            segs = merge_short_slash(&segs, beat_of, pr.short_slash);
+        }
+        if pr.merge_similar {
+            segs = self.merge_similar(&segs, detail);
+        }
+        segs.iter().map(|seg| self.chord(seg, &info.keys)).collect()
+    }
+
+    /// The output chord of a segment: its mir_eval label and its symbol in the key around its middle.
+    fn chord(&self, seg: &Segment, keys: &[(f64, f64, String)]) -> Chord {
+        let (start, end) = (seg.start as f64 / FRAME_RATE, seg.end as f64 / FRAME_RATE);
+        if seg.detail >= NO_CHORD {
+            return Chord { start, end, label: "N".into(), root: None, quality: None, bass: None, symbol: "N".into() };
+        }
+        let (root, q) = (seg.detail % 12, seg.detail / 12);
+        let quality = &self.qualities[q];
+        let bass = (seg.bass < 12).then_some(seg.bass);
+        let mut label = format!("{}:{}", SHARP[root], self.labels[q]);
+        if let Some(bass) = bass {
+            let interval = (bass + 12 - root) % 12;
+            if interval != 0 {
+                label += &format!("/{}", DEGREES[interval]);
+            }
+        }
+        let middle = (start + end) / 2.0;
+        let key = keys
+            .iter()
+            .find(|(a, b, _)| *a <= middle && middle < *b)
+            .or(keys.last())
+            .map(|(_, _, k)| k.as_str());
+        let symbol = chord_symbol(root, quality, bass, key);
+        Chord { start, end, label, root: Some(root), quality: Some(quality.clone()), bass, symbol }
     }
 
     /// `semi_crf.decode`: per frame the root x family state (N last) and the bass (12 under N).
@@ -214,6 +348,20 @@ impl Decoder {
                 }
             }
         }
+        // the chord-bass pair's prior, paid once per segment (not by a continuation)
+        let mut prior = vec![0.0f64; k_n * 12];
+        if pr.bass_prior != 0.0 {
+            for (idx, &st) in keep[..k_n - 1].iter().enumerate() {
+                let (fam, root) = (st / 12, st % 12);
+                let table = &self.bass_interval[fam * 12..(fam + 1) * 12];
+                // a symmetric chord: the bass's best reading over its spellings
+                let rots: Vec<usize> = self.equivalent_roots(fam, 0);
+                for b in 0..12 {
+                    let best = rots.iter().map(|&r| table[(b + 24 - root - r) % 12]).fold(f64::NEG_INFINITY, f64::max);
+                    prior[idx * 12 + b] = pr.bass_prior * best;
+                }
+            }
+        }
         // the forward over candidates (`semi_crf._forward`)
         let size = (m + 1) * k_n * 12;
         let at3 = |j: usize, k: usize, b: usize| (j * k_n + k) * 12 + b;
@@ -226,7 +374,7 @@ impl Decoder {
         let basses = |k: usize| if k != n_idx { 12 } else { 1 };
         for k in 0..k_n {
             for b in 0..basses(k) {
-                start_c[at3(0, k, b)] = g_chord[0];
+                start_c[at3(0, k, b)] = g_chord[0] + prior[k * 12 + b];
             }
         }
         let mut best_k = vec![0.0f64; k_n];
@@ -287,7 +435,8 @@ impl Decoder {
                 if k != n_idx {
                     for b in 0..12 {
                         let other = if b == mb { m2 } else { mx };
-                        start_b[at3(j, k, b)] = other - pr.bass_penalty - nct[k * 12 + b] + pos_b[j] + g_stay[j];
+                        start_b[at3(j, k, b)] =
+                            other - pr.bass_penalty - nct[k * 12 + b] + prior[k * 12 + b] + pos_b[j] + g_stay[j];
                     }
                 }
                 for b in 0..basses(k) {
@@ -306,7 +455,7 @@ impl Decoder {
                 (prev_k[j * k_n + k], prev_kb[j * k_n + k]) = (mk as u32, best_kb[mk] as u8);
                 let sc = mx - pr.penalty + pos_c[j] + g_chord[j];
                 for b in 0..basses(k) {
-                    start_c[at3(j, k, b)] = sc;
+                    start_c[at3(j, k, b)] = sc + prior[k * 12 + b];
                 }
             }
         }
@@ -416,8 +565,10 @@ impl Decoder {
             .collect()
     }
 
-    /// `chords.segments`: the runs of the path, each with the quality of its family that has the highest mean share.
-    fn segments(&self, p: &Probs, family: &[f32], chord_path: &[usize], bass_path: &[usize]) -> Vec<Chord> {
+    /// `chords.segments`: the runs of the path, each with the quality of its family that has the highest mean share
+    /// (`detail`: what the search read; `family`: its root x family sums, the symmetric chords not merged); a
+    /// symmetric chord is spelt from the root its frames favour.
+    fn segments(&self, detail: &[f32], family: &[f32], chord_path: &[usize], bass_path: &[usize]) -> Vec<Segment> {
         let s = self.states;
         let n_family = s - 1;
         let frames = chord_path.len();
@@ -428,38 +579,196 @@ impl Decoder {
             while b < frames && chord_path[b] == chord_path[a] && bass_path[b] == bass_path[a] {
                 b += 1;
             }
-            let (start, end) = (a as f64 / FRAME_RATE, b as f64 / FRAME_RATE);
-            let c = chord_path[a];
+            let mut c = chord_path[a];
             if c == n_family {
-                out.push(Chord { start, end, label: "N".into(), root: None, quality: None, bass: None });
+                out.push(Segment { start: a, end: b, detail: NO_CHORD, bass: 12 });
             } else {
-                let (root, fam) = (c % 12, c / 12);
+                let (mut root, fam) = (c % 12, c / 12);
+                let roots = if self.params.symmetric { self.equivalent_roots(fam, root) } else { vec![root] };
+                if roots.len() > 1 {
+                    let mass = |r: usize| (a..b).map(|t| family[t * s + 12 * fam + r]).sum::<f32>();
+                    let mut best = (f32::NEG_INFINITY, root);
+                    for &r in &roots {
+                        let m = mass(r);
+                        if m > best.0 {
+                            best = (m, r);
+                        }
+                    }
+                    root = best.1;
+                    c = 12 * fam + root;
+                }
                 let members: Vec<usize> = (0..self.quality_family.len()).filter(|&q| self.quality_family[q] == fam).collect();
                 let mut best = (f32::NEG_INFINITY, 0usize);
                 for &q in &members {
                     let share = (a..b)
-                        .map(|t| p.detail[t * DETAIL + 12 * q + root] / family[t * s + c].max(1e-9))
+                        .map(|t| detail[t * DETAIL + 12 * q + root] / family[t * s + c].max(1e-9))
                         .sum::<f32>()
                         / (b - a) as f32;
                     if share > best.0 {
                         best = (share, q);
                     }
                 }
-                let q = best.1;
-                let bass = bass_path[a];
-                let mut label = format!("{}:{}", SHARP[root], self.labels[q]);
-                let bass = (bass < 12).then_some(bass);
-                if let Some(bass) = bass {
-                    let interval = (bass + 12 - root) % 12;
-                    if interval != 0 {
-                        label += &format!("/{}", DEGREES[interval]);
-                    }
-                }
-                out.push(Chord { start, end, label, root: Some(root), quality: Some(self.qualities[q].clone()), bass });
+                out.push(Segment { start: a, end: b, detail: 12 * best.1 + root, bass: bass_path[a] });
             }
             a = b;
         }
         out
+    }
+
+    /// `chords.merge_similar`: neighbouring segments over the same bass whose notes (bass included) are a subset of
+    /// one another but whose roots differ joined into one, keeping the reading with the more probability over both.
+    fn merge_similar(&self, segs: &[Segment], detail: &[f32]) -> Vec<Segment> {
+        let notes = |seg: &Segment| -> u16 {
+            let t = &self.tones[seg.detail * 12..(seg.detail + 1) * 12];
+            (0..12).filter(|&p| t[p] != 0.0).fold(1u16 << seg.bass, |m, p| m | 1 << p)
+        };
+        let weight = |seg: &Segment, a: usize, b: usize| -> f32 {
+            let (quality, root) = (seg.detail / 12, seg.detail % 12);
+            let roots =
+                if self.params.symmetric { self.equivalent_roots(self.quality_family[quality], root) } else { vec![root] };
+            (a..b).map(|t| roots.iter().map(|&r| detail[t * DETAIL + 12 * quality + r]).sum::<f32>()).sum()
+        };
+        let mut out: Vec<Segment> = Vec::new();
+        for seg in segs {
+            if let Some(prev) = out.last_mut() {
+                let subset = || {
+                    let (p, n) = (notes(prev), notes(seg));
+                    p & !n == 0 || n & !p == 0
+                };
+                if prev.detail != NO_CHORD
+                    && seg.detail != NO_CHORD
+                    && prev.bass == seg.bass
+                    && prev.detail % 12 != seg.detail % 12
+                    && subset()
+                {
+                    let keep = if weight(prev, prev.start, seg.end) >= weight(seg, prev.start, seg.end) { *prev } else { *seg };
+                    *prev = Segment { start: prev.start, end: seg.end, ..keep };
+                    continue;
+                }
+            }
+            out.push(*seg);
+        }
+        out
+    }
+}
+
+const NO_CHORD: usize = DETAIL - 1;
+
+/// `chords.merge_fifth_bass`: a bass-only change between the chord's root and its fifth dropped; the joined segment
+/// keeps the bass `keep` names (`first`, `longer` or `root`).
+fn merge_fifth_bass(segs: &[Segment], keep: &str) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for seg in segs {
+        if let Some(prev) = out.last_mut()
+            && prev.detail == seg.detail
+            && seg.detail < NO_CHORD
+        {
+            let root = seg.detail % 12;
+            let (a, b) = ((prev.bass + 12 - root) % 12, (seg.bass + 12 - root) % 12);
+            if (a, b) == (0, 7) || (a, b) == (7, 0) {
+                let bass = match keep {
+                    "longer" if prev.end - prev.start < seg.end - seg.start => seg.bass,
+                    "root" => root,
+                    _ => prev.bass,
+                };
+                *prev = Segment { end: seg.end, bass, ..*prev };
+                continue;
+            }
+        }
+        out.push(*seg);
+    }
+    out
+}
+
+/// `chords.merge_short_slash`: a chord that opens with another bass for less than `max_beats` beats and then moves
+/// to its root read as the root-position chord throughout (`beat_of`: frame -> beat).
+fn merge_short_slash(segs: &[Segment], beat_of: impl Fn(usize) -> f64, max_beats: f64) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    for seg in segs {
+        let n = out.len();
+        if let Some(&prev) = out.last() {
+            let opening = n == 1 || out[n - 2].detail != prev.detail;
+            if opening
+                && prev.detail == seg.detail
+                && seg.detail < NO_CHORD
+                && prev.bass != seg.bass
+                && seg.bass == seg.detail % 12
+                && prev.bass != prev.detail % 12
+                && beat_of(prev.end) - beat_of(prev.start) < max_beats
+            {
+                out[n - 1] = Segment { start: prev.start, ..*seg };
+                continue;
+            }
+        }
+        out.push(*seg);
+    }
+    out
+}
+
+const FLAT: [&str; 12] = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
+const LETTERS: [char; 7] = ['C', 'D', 'E', 'F', 'G', 'A', 'B'];
+const NATURAL: [i32; 7] = [0, 2, 4, 5, 7, 9, 11];
+/// Letter steps of the 12 degrees above the tonic: 1, b2, 2, b3, 3, 4, #4, 5, b6, 6, b7, 7.
+const DEGREE_STEP: [usize; 12] = [0, 1, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6];
+
+/// A letter with `shift` (-1, 0 or 1) as a note name.
+fn with_accidental(letter: char, shift: i32) -> String {
+    format!("{letter}{}", match shift {
+        1 => "#",
+        -1 => "b",
+        _ => "",
+    })
+}
+
+/// The letter `step` letters above `name`'s and how far `pc` lies from it (-6..5).
+fn letter_above(name: &str, step: usize, pc: usize) -> (char, i32) {
+    let first = name.chars().next().unwrap_or('C');
+    let at = LETTERS.iter().position(|&l| l == first).unwrap_or(0);
+    let letter_index = (at + step) % 7;
+    (LETTERS[letter_index], (pc as i32 - NATURAL[letter_index] + 6).rem_euclid(12) - 6)
+}
+
+/// `decode.spell`: the name of pitch class `pc` in `key` (e.g. `A:minor`): the key's tonic spelt by its key
+/// signature, the other notes by their degree above it; with `raised` a note outside the key is spelt as a raised
+/// degree instead (the root of a diminished chord leads up).  Cb, Fb, E# and B# are written B, E, F and C.  No key:
+/// C major's spelling.
+fn spell(pc: usize, key: Option<&str>, raised: bool) -> String {
+    let (tonic, mode) = key.unwrap_or("C:major").split_once(':').unwrap_or((key.unwrap_or("C:major"), ""));
+    let index = |t: &str| SHARP.iter().position(|&n| n == t).or_else(|| FLAT.iter().position(|&n| n == t));
+    let (t, mode) = match index(tonic) {
+        Some(t) => (t, mode),
+        None => (0, "major"),
+    };
+    let parent = (t as i64 + decoder_parent(mode)).rem_euclid(12) as usize;
+    let names = if [1, 3, 5, 8, 10].contains(&parent) { FLAT } else { SHARP };
+    let degree = (pc + 12 - t) % 12;
+    let mut step = DEGREE_STEP[degree];
+    if raised && !NATURAL.contains(&(((pc + 12 - parent) % 12) as i32)) && [1, 3, 8, 10].contains(&degree) {
+        step -= 1;
+    }
+    let (letter, shift) = letter_above(names[t], step, pc);
+    let name = if (-1..=1).contains(&shift) { with_accidental(letter, shift) } else { names[pc].to_string() };
+    if ["Cb", "Fb", "E#", "B#"].contains(&name.as_str()) { names[pc].to_string() } else { name }
+}
+
+/// `decode.chord_symbol`: a chord symbol as in lead sheets, e.g. `Am7/G`, `FM7`, `G7(b9)`, `Bm7-5`.
+fn chord_symbol(root: usize, quality: &str, bass: Option<usize>, key: Option<&str>) -> String {
+    let name = spell(root, key, quality.starts_with("dim"));
+    let symbol = format!("{name}{quality}");
+    let Some(bass) = bass.filter(|&b| b != root) else { return symbol };
+    // the bass by its interval above the root (B7/D#, C/Bb), else as the key spells it
+    let interval = (bass + 12 - root) % 12;
+    let mut step = DEGREE_STEP[interval];
+    if interval == 6 && (quality.contains("-5") || quality.starts_with("dim")) {
+        step = 4; // b5
+    } else if interval == 8 && quality.contains("aug") {
+        step = 4; // #5
+    }
+    let (letter, shift) = letter_above(&name, step, bass);
+    let low = (-1..=1).contains(&shift).then(|| with_accidental(letter, shift));
+    match low {
+        Some(low) if !["Cb", "Fb", "E#", "B#"].contains(&low.as_str()) => format!("{symbol}/{low}"),
+        _ => format!("{symbol}/{}", spell(bass, key, false)),
     }
 }
 

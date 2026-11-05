@@ -650,6 +650,12 @@ impl BarModel {
 
     /// The key of each bar (`HeadKeys.keys`), indices `12 * mode + tonic`.
     pub fn keys(&self, beats: &[f64], downbeats: &[f64], f: &BeatFeatures) -> Vec<usize> {
+        self.keys_decoded(beats, downbeats, f, &Value::Null)
+    }
+
+    /// `keys` with `overrides` (`local_weight`, `boundary_weight`, `mode_tau`, `min_bars`) over the model's decoding.
+    pub fn keys_decoded(&self, beats: &[f64], downbeats: &[f64], f: &BeatFeatures, overrides: &Value) -> Vec<usize> {
+        let setting = |k: &str| overrides.get(k).filter(|v| !v.is_null()).or_else(|| self.decoding.get(k)).and_then(Value::as_f64);
         let x = self.inputs(beats, downbeats, f);
         let y = self.encode(&x);
         let whole = self.output(&y, x.bars, "key");
@@ -658,10 +664,11 @@ impl BarModel {
         if let Some(local) = &self.local {
             let l = self.local_keys(local, &x);
             for (k, l) in key.chunks_mut(keys).zip(l.chunks(keys)) {
-                k.iter_mut().zip(log_softmax(l)).for_each(|(k, l)| *k += self.local_weight * l);
+                let weight = setting("local_weight").map_or(self.local_weight, |v| v as f32);
+                k.iter_mut().zip(log_softmax(l)).for_each(|(k, l)| *k += weight * l);
             }
         }
-        let tau = self.decoding.get("mode_tau").and_then(Value::as_f64).unwrap_or(0.0);
+        let tau = setting("mode_tau").unwrap_or(0.0);
         let counts: Vec<f64> = self.decoding["mode_counts"]
             .as_array()
             .map(|a| a.iter().filter_map(Value::as_f64).collect())
@@ -677,8 +684,9 @@ impl BarModel {
             })
             .collect();
         let boundary: Vec<f32> = self.output(&y, x.bars, "boundary").into_iter().map(sigmoid).collect();
-        let weight = self.decoding.get("boundary_weight").and_then(Value::as_f64).unwrap_or(1.0);
-        decode(&key_logp, keys, &boundary, weight)
+        let weight = setting("boundary_weight").unwrap_or(1.0);
+        let min_bars = setting("min_bars").map_or(1, |v| v.max(1.0) as usize);
+        decode(&key_logp, keys, &boundary, weight, min_bars)
     }
 }
 
@@ -844,12 +852,15 @@ fn segments(
 }
 
 /// `keys.decode`: the likeliest key per bar from per-bar key log-probabilities `[bars, keys]` and change
-/// probabilities `[bars]`.
-fn decode(key_logp: &[f64], n: usize, boundary_p: &[f32], boundary_weight: f64) -> Vec<usize> {
+/// probabilities `[bars]`; with `min_bars` > 1 no key segment but the first and the last is shorter.
+fn decode(key_logp: &[f64], n: usize, boundary_p: &[f32], boundary_weight: f64, min_bars: usize) -> Vec<usize> {
     let bars = boundary_p.len();
     let p: Vec<f32> = boundary_p.iter().map(|p| p.clamp(1e-6, 1.0 - 1e-6)).collect();
     let change: Vec<f32> = p.iter().map(|p| boundary_weight as f32 * p.ln()).collect();
     let stay: Vec<f32> = p.iter().map(|p| boundary_weight as f32 * (-p).ln_1p()).collect();
+    if min_bars > 1 {
+        return decode_segments(key_logp, n, &change, &stay, min_bars);
+    }
     let mut best = key_logp[..n].to_vec();
     let mut back = vec![0usize; bars * n];
     for i in 1..bars {
@@ -870,6 +881,63 @@ fn decode(key_logp: &[f64], n: usize, boundary_p: &[f32], boundary_weight: f64) 
     out[bars - 1] = argmax(best.iter().copied());
     for i in (1..bars).rev() {
         out[i - 1] = back[i * n + out[i]];
+    }
+    out
+}
+
+/// `keys.decode_segments`: a semi-Markov Viterbi over segments `[s, e)` of one key, each scoring its bars' key
+/// log-probabilities, `stay` on its bars after the first and `change` on its first bar (not the song's); a segment
+/// differs from the one before and is at least `min_bars` long unless it starts or ends the song.
+fn decode_segments(key_logp: &[f64], n: usize, change: &[f32], stay: &[f32], min_bars: usize) -> Vec<usize> {
+    let bars = change.len();
+    let mut summed = vec![0.0f64; (bars + 1) * n];
+    for i in 0..bars {
+        for k in 0..n {
+            summed[(i + 1) * n + k] = summed[i * n + k] + key_logp[i * n + k];
+        }
+    }
+    let mut stayed = vec![0.0f64; bars + 1];
+    let mut acc = 0.0f32; // numpy's float32 cumsum
+    for (i, &s) in stay.iter().enumerate() {
+        acc += s;
+        stayed[i + 1] = acc as f64;
+    }
+    // best[e][k]: the best decoding of bars [0, e) ending with key k
+    let mut best = vec![f64::NEG_INFINITY; (bars + 1) * n];
+    let mut start = vec![0usize; (bars + 1) * n];
+    let mut before = vec![usize::MAX; (bars + 1) * n];
+    let mut prev = vec![usize::MAX; n];
+    for e in 1..=bars {
+        for s in (0..e).rev() {
+            if e - s < min_bars && 0 < s && e < bars {
+                continue;
+            }
+            if s > 0 {
+                // the best other key, as in `decode`
+                let row = &best[s * n..(s + 1) * n];
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                for (k, p) in prev.iter_mut().enumerate() {
+                    *p = if k == order[0] { order[1] } else { order[0] };
+                }
+            }
+            for k in 0..n {
+                let score = summed[e * n + k] - summed[s * n + k] + stayed[e] - stayed[s + 1];
+                let total = if s == 0 { score } else { best[s * n + prev[k]] + change[s] as f64 + score };
+                if total > best[e * n + k] {
+                    best[e * n + k] = total;
+                    start[e * n + k] = s;
+                    before[e * n + k] = if s == 0 { usize::MAX } else { prev[k] };
+                }
+            }
+        }
+    }
+    let mut out = vec![0usize; bars];
+    let (mut e, mut key) = (bars, argmax(best[bars * n..].iter().copied()));
+    while e > 0 {
+        let s = start[e * n + key];
+        out[s..e].fill(key);
+        (e, key) = (s, before[e * n + key]);
     }
     out
 }
@@ -905,8 +973,16 @@ pub fn sections_json(model: &BarModel, f: &FrameInputs, beats: &[f64], downbeats
         .collect()
 }
 
-/// `keys.json`'s `keys` for the tracked (rounded) `beats` and `downbeats`.
-pub fn keys_json(model: &BarModel, f: &FrameInputs, beats: &[f64], downbeats: &[f64], duration: f64) -> Value {
+/// `keys.json`'s `keys` for the tracked (rounded) `beats` and `downbeats`; `overrides` go over the model's decoding
+/// (`BarModel::keys_decoded`).
+pub fn keys_json(
+    model: &BarModel,
+    f: &FrameInputs,
+    beats: &[f64],
+    downbeats: &[f64],
+    duration: f64,
+    overrides: &Value,
+) -> Value {
     if beats.len() < 2 {
         return Value::Array(Vec::new());
     }
@@ -914,7 +990,7 @@ pub fn keys_json(model: &BarModel, f: &FrameInputs, beats: &[f64], downbeats: &[
     let mut edges = bar_edges(beats, downbeats, duration);
     edges[0] = 0.0;
     let mut found: Vec<Value> = Vec::new();
-    for (i, key) in model.keys(beats, downbeats, &features).into_iter().enumerate() {
+    for (i, key) in model.keys_decoded(beats, downbeats, &features, overrides).into_iter().enumerate() {
         let name = key_name(key);
         match found.last_mut() {
             Some(last) if last["key"] == name.as_str() => {
@@ -958,6 +1034,21 @@ mod tests {
     fn decode_changes_key_on_a_likely_boundary() {
         let n = 3;
         let logp = [-0.1, -3.0, -3.0, -0.1, -3.0, -3.0, -3.0, -0.1, -3.0, -3.0, -0.1, -3.0];
-        assert_eq!(decode(&logp, n, &[0.5, 0.01, 0.9, 0.01], 1.0), vec![0, 0, 1, 1]);
+        assert_eq!(decode(&logp, n, &[0.5, 0.01, 0.9, 0.01], 1.0, 1), vec![0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn decode_segments_keeps_keys_for_min_bars() {
+        // bars favour keys 0 0 1 0 1 1 1 1: the bar Viterbi flips back and forth, min_bars 3 does not
+        let n = 2;
+        let favour = [0, 0, 1, 0, 1, 1, 1, 1];
+        let logp: Vec<f64> = favour.iter().flat_map(|&k| [if k == 0 { -0.1 } else { -2.5 }, if k == 1 { -0.1 } else { -2.5 }]).collect();
+        let boundary = [0.5f32; 8];
+        assert_eq!(decode(&logp, n, &boundary, 0.1, 1), favour.to_vec());
+        let got = decode(&logp, n, &boundary, 0.1, 3);
+        let changes = got.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(changes, 1, "{got:?}");
+        let runs: Vec<usize> = got.chunk_by(|a, b| a == b).map(<[usize]>::len).collect();
+        assert!(runs[1..runs.len() - 1].iter().all(|&r| r >= 3), "{got:?}");
     }
 }

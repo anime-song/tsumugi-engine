@@ -25,6 +25,8 @@ pub struct Options {
     pub local_seconds: f64,
     pub p_hold: f64,
     pub q_hold: f64,
+    /// `HeadBeats.refold`: runs of half-length bars read again at the surrounding tempo (`refold`).
+    pub refold: bool,
 }
 
 impl Default for Options {
@@ -43,6 +45,7 @@ impl Default for Options {
             local_seconds: 2.0,
             p_hold: 0.0,
             q_hold: 0.98,
+            refold: true,
         }
     }
 }
@@ -572,6 +575,63 @@ pub fn apply_offsets(
     (moved_beats, downs)
 }
 
+/// Beats and bar heads with runs of half-length bars read at the surrounding tempo (`refold`).  A bar is half-length
+/// when it lasts `low`-`high` times the median of the bars with as many beats within `context` bars either side.  A
+/// run of them with an even beat count, between full-length bars of that count, loses every other beat; its half
+/// bars are merged in pairs, and an odd one left over stays a half bar (a 2/4 bar in 4/4).
+pub fn refold(beats: &[f64], downbeats: &[f64], low: f64, high: f64, context: usize) -> (Vec<f64>, Vec<f64>) {
+    let bars = downbeats.len();
+    if bars < 3 || beats.is_empty() {
+        return (beats.to_vec(), downbeats.to_vec());
+    }
+    let mut edges = downbeats.to_vec();
+    edges.push(beats[beats.len() - 1] + 1e-3);
+    let inside: Vec<Vec<usize>> = edges
+        .windows(2)
+        .map(|e| (0..beats.len()).filter(|&k| beats[k] >= e[0] - 1e-6 && beats[k] < e[1] - 1e-6).collect())
+        .collect();
+    let count: Vec<usize> = inside.iter().map(Vec::len).collect();
+    let length: Vec<f64> = edges.windows(2).map(|e| e[1] - e[0]).collect();
+    let mut half = vec![false; bars];
+    for i in 0..bars - 1 {
+        // the last bar's length is not known
+        let same: Vec<f64> = (i.saturating_sub(context)..(i + context + 1).min(bars - 1))
+            .filter(|&j| j != i && count[j] == count[i])
+            .map(|j| length[j])
+            .collect();
+        if !same.is_empty() {
+            let r = length[i] / median(same);
+            half[i] = low < r && r < high;
+        }
+    }
+    let (mut keep, mut merged) = (vec![true; beats.len()], vec![false; bars]);
+    let mut i = 0;
+    while i < bars - 1 {
+        if !half[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bars - 1 && half[j] && count[j] == count[i] {
+            j += 1;
+        }
+        if i > 0 && !half[i - 1] && count[i - 1] == count[i] && count[i] == count[j] && !half[j] && count[i].is_multiple_of(2) {
+            for k in i..j {
+                for &b in inside[k].iter().skip(1).step_by(2) {
+                    keep[b] = false;
+                }
+            }
+            for m in (i + 1..j).step_by(2) {
+                merged[m] = true;
+            }
+        }
+        i = j;
+    }
+    let beats = beats.iter().zip(&keep).filter(|(_, k)| **k).map(|(b, _)| *b).collect();
+    let downbeats = downbeats.iter().zip(&merged).filter(|(_, m)| !**m).map(|(d, _)| *d).collect();
+    (beats, downbeats)
+}
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
@@ -645,6 +705,9 @@ pub fn track_beats(probs: &BeatProbs, o: &Options, tempo_weight: f64) -> Tracked
     if let Some(offset) = &probs.beat_offset {
         (beats, downbeats) = apply_offsets(&beats, &downbeats, &probs.beat, offset, 0.06);
     }
+    if o.refold {
+        (beats, downbeats) = refold(&beats, &downbeats, 0.42, 0.58, 32);
+    }
     let mut bars: Vec<Bar> = downbeats
         .iter()
         .enumerate()
@@ -661,4 +724,40 @@ pub fn track_beats(probs: &BeatProbs, o: &Options, tempo_weight: f64) -> Tracked
         }
     }
     Tracked { beats, downbeats, bars, meters }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 4/4 bars of 2 s around `halves` bars of 1 s (the head counting eighths as beats).
+    fn song(halves: usize) -> (Vec<f64>, Vec<f64>) {
+        let (mut t, mut beats, mut downbeats) = (0.3, Vec::new(), Vec::new());
+        for i in 0..6 + halves + 6 {
+            let length = if (6..6 + halves).contains(&i) { 1.0 } else { 2.0 };
+            downbeats.push(t);
+            beats.extend((0..4).map(|k| t + k as f64 * length / 4.0));
+            t += length;
+        }
+        (beats, downbeats)
+    }
+
+    #[test]
+    fn refold_reads_half_bars_at_the_surrounding_tempo() {
+        // as bar_tracker.refold: an even run becomes full bars, an odd one keeps a 2/4 bar
+        let grid = |n: usize| (0..n).map(|i| 0.3 + 0.5 * i as f64).collect::<Vec<_>>();
+        let round = |v: Vec<f64>| v.into_iter().map(|x| (x * 1e6).round() / 1e6).collect::<Vec<_>>();
+        let (beats, downbeats) = song(4);
+        let (b, d) = refold(&beats, &downbeats, 0.42, 0.58, 32);
+        assert_eq!(round(b), round(grid(56)));
+        assert_eq!(round(d), round((0..14).map(|i| 0.3 + 2.0 * i as f64).collect()));
+        let (beats, downbeats) = song(3);
+        let (b, d) = refold(&beats, &downbeats, 0.42, 0.58, 32);
+        assert_eq!(round(b), round(grid(54)));
+        let want: Vec<f64> = [0.3, 2.3, 4.3, 6.3, 8.3, 10.3, 12.3, 14.3, 15.3, 17.3, 19.3, 21.3, 23.3, 25.3].into();
+        assert_eq!(round(d), round(want));
+        // no half bars: unchanged
+        let (beats, downbeats) = song(0);
+        assert_eq!(refold(&beats, &downbeats, 0.42, 0.58, 32), (beats, downbeats));
+    }
 }

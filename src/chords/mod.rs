@@ -4,6 +4,7 @@
 pub mod decode;
 pub mod frontend;
 pub mod net;
+pub mod repeat;
 
 use std::path::Path;
 
@@ -30,6 +31,9 @@ pub struct Chords {
     pub net: ChordNet,
     pub decoder: decode::Decoder,
     pub weights: Weights,
+    /// The key decoding of the SheetSage2-Refined revision the model reads its keys from (`beats_keys`), over the
+    /// key model's own (Null: the key model's own).
+    pub key_decoding: serde_json::Value,
 }
 
 /// The model's 25 Hz probabilities: `bass` `[frames, 13]`, `detail` `[frames, 745]`, `boundary` `[frames]`.
@@ -44,7 +48,9 @@ impl Chords {
     /// `int16`: the model's matrix products on int16 values (`crate::q16`), else float32.
     pub fn load(path: &Path, int16: bool) -> Result<Self> {
         let weights = Weights::open_format(path, FORMAT, "python/export_chords.py")?;
-        Ok(Self { net: ChordNet::load(&weights, int16)?, decoder: decode::Decoder::load(&weights)?, weights })
+        let beats_keys: serde_json::Value = serde_json::from_str(weights.metadata.get("beats_keys").map_or("{}", |s| s))?;
+        let key_decoding = beats_keys.get("key_decoding").cloned().unwrap_or_default();
+        Ok(Self { net: ChordNet::load(&weights, int16)?, decoder: decode::Decoder::load(&weights)?, weights, key_decoding })
     }
 
     /// `tsumugi_chords.note_chords.song_logits`: the 25 Hz probabilities over a stereo song at the model's rate.
@@ -208,7 +214,13 @@ fn key_index(name: &str) -> Option<usize> {
 pub fn parent_tonic(name: &str) -> Option<usize> {
     let (tonic, mode) = name.split_once(':').unwrap_or((name, ""));
     let tonic = SHARP.iter().position(|&s| s == tonic)? as i64;
-    Some((tonic + parent(mode)).rem_euclid(12) as usize)
+    Some((tonic + decoder_parent(mode)).rem_euclid(12) as usize)
+}
+
+/// The decoder's `chord_crf.PARENT`: `parent` and phrygian dominant's (the model's key features, `note_chords.PARENT`,
+/// have none for it).
+pub fn decoder_parent(mode: &str) -> i64 {
+    if mode == "phrygian_dominant" { -4 } else { parent(mode) }
 }
 
 /// `note_chords.key_features`: `[frames, 25]` of a window from `start` (s).

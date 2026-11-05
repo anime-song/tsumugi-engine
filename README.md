@@ -14,7 +14,8 @@ python python/export_sheetsage.py cpu.safetensors [--dtype f16|f32|i8] [--lora A
 python python/export_chords.py chords.safetensors          # Tsumugi-Chords (anime-song/Tsumugi-Chords)
 cargo build --release
 ./target/release/tsumugi-engine --weights cpu.safetensors [--chords chords.safetensors] [--adapter LORA] \
-    [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--tempo-weight W] [--precision f32|int16] [--logits] song.mp3 ...
+    [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--tempo-weight W] [--no-refold] \
+    [--notation symbol|harte] [--precision f32|int16] [--logits] song.mp3 ...
 ```
 
 writes `<out-dir>/<song>.beats.json`, `<song>.melody.json`, `<song>.sections.json` and `<song>.keys.json` (those
@@ -24,11 +25,20 @@ and `key` run the beat and melody heads as well, `key` also the chord head (`res
 one pass of the encoder. `--logits` also writes the heads' logits and, for `section` / `key`, the encoder states'
 block means (`<song>.heads.safetensors`), and `--from-logits` runs only the trackers and the section and key models
 on such files. Weights exported before the section and key models were added hold neither: export them again.
+The beat tracker reads runs of half-length bars at the surrounding tempo as `beats` does since 0.5.2
+(`bar_tracker.refold`; `--no-refold` as there), and the keys are decoded with the export's `min_bars` (0.5.1:
+segments of at least 4 bars). The weights did not change in 0.5.1 / 0.5.2, but the key decoding is in the export's
+metadata: export again to get it (an older export decodes the keys bar by bar).
 
 With `--chords`, also `<song>.chords.json` and `<song>.chords.lab` as `tsumugi-chords` writes them: the chord model
 reads the song in stereo at 25.6 kHz with the beats, downbeats and keys of the same run (the key model runs whether
-or not `key` is in `--heads`). Export both files from the versions that go together: Tsumugi-Chords' `config.json`
-names the SheetSage2-Refined revision it was trained with (`beats_keys`, v0.5.0 for the first release).
+or not `key` is in `--heads`). The `.lab` holds chord symbols spelt in their key (`Am7/G`), `--notation harte` the
+Harte labels (`A:min7/b7`); the `.json` has both (`symbol`, `label`). Tsumugi-Chords' `config.json` names the
+SheetSage2-Refined revision it reads its keys from (`beats_keys`, v0.5.0); `export_chords.py` stores that
+revision's key decoding, and the chord model's keys are decoded with it (bar by bar for v0.5.0), as
+`tsumugi-chords` does, while `keys.json` keeps the decoding of `cpu.safetensors`. The decoder is Tsumugi-Chords
+0.2.0's (repeated bars, the bass-interval prior, symmetric chords and the merges after the search): export
+`chords.safetensors` again from 0.2.0 (the model's weights are the same; an older export runs the 0.1 decoder).
 
 `--precision int16` runs the encoder's linear layers and attention core and the chord model's linear layers and
 convolutions on int16 values (`vpmaddwd`, twice the multiply-adds of a float32 FMA per instruction; for AVX2 CPUs
@@ -136,8 +146,8 @@ within 2e-5. Its speed has to be measured on the GPU it runs on:
   products stay in cache) and the 5 x 5 one by F(2 x 2, 5 x 5) (`src/winograd5.rs`, 2.8 times fewer, kept float32), the axis Transformer with RMSNorm scales and attention's scale folded into the next
   layers, each block's norms, products and residuals run 96 tokens per task. The last layer runs only for what the
   chord queries read (their row attention, then their time attention), and attention is an AVX2 kernel over 4
-  queries at a time. The decoder (`semi_crf.decode`, `chords.segments`) is ported
-  line by line with its tables from the export.
+  queries at a time. The decoder (`repeat.smooth`, `semi_crf.decode`, `chords.segments` and the `merge_*` after
+  it, the chord symbols of `decode.chord_symbol`) is ported line by line with its tables from the export.
 * The trackers (`src/tracker.rs`, `src/melody.rs`) are `bar_tracker.py` and `melody.py`'s `line_notes` / `notes`
   line by line, the beat tracker's interval transitions as AVX2 max-plus products.
 * The section and key models (`src/bars.rs`) read the encoder states averaged over three groups of blocks, which
@@ -166,6 +176,12 @@ Python ones on the logits of both songs and on 20 noisy copies (noise up to 3 on
 (`--heads section,key --logits`) and compares the sections and keys with the engine's. On the synthetic songs
 (60, 100 and 330 s, and one a few samples over a 300 s window) they are equal; the section model's logits differ
 by at most 1e-4 and the key log-probabilities by at most 0.002.
+
+`scripts/check_chords.py` runs Tsumugi-Chords (PyTorch) on the engine's beats, downbeats and keys and compares the
+chords (times, labels, symbols); `examples/chords_decode.rs` runs the decoder alone on given probabilities. With
+SheetSage2-Refined 0.5.2 and Tsumugi-Chords 0.2.0 the chords of a 240 s and a 60 s synthetic song are equal, and so
+are the decoder's on 120 altered copies of a song's probabilities (repeated and transposed passages, aug and dim7
+chords, passing basses, chords split between two readings, keys in every mode).
 
 ## Speed and memory
 

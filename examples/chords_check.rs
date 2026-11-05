@@ -56,7 +56,7 @@ fn main() -> tsumugi_engine::Result<()> {
         bytes.iter().map(|(n, s, b)| (n.clone(), TensorView::new(Dtype::F32, s.clone(), b).unwrap())).collect();
     let labels: Vec<serde_json::Value> = chords
         .iter()
-        .map(|c| serde_json::json!({"start": c.start, "end": c.end, "label": c.label, "root": c.root, "quality": c.quality, "bass": c.bass}))
+        .map(|c| c.json())
         .collect();
     let meta = HashMap::from([("chords".to_string(), serde_json::to_string(&labels)?)]);
     safetensors::serialize_to_file(views, Some(meta), args[3].as_ref())?;

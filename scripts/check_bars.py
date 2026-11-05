@@ -65,7 +65,7 @@ def main():
         keys.config["local_weight"] = decoding["local_weight"]
     per_mode = mode_bias(decoding.get("mode_tau", 0.0), config.get("mode_counts"))
     bias = None if per_mode is None else np.array([per_mode[MODES.index(mode)] for _, mode in KEYS])
-    keys = HeadKeys(sections, None, keys, device, decoding.get("boundary_weight", 1.0), bias)
+    keys = HeadKeys(sections, None, keys, device, decoding.get("boundary_weight", 1.0), bias, int(decoding.get("min_bars") or 1))
     failures = 0
     for path in args.logits:
         stem = path.name.removesuffix(".heads.safetensors")

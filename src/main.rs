@@ -21,7 +21,7 @@ use tsumugi_engine::{Frames, MemoryWatch, Model, Outputs, Result, audio, bars, e
 fn usage() -> ! {
     eprintln!(
         "usage: tsumugi-engine --weights FILE [--adapter LORA] [--threads N] [--out-dir DIR] [--heads beat,melody,section,key] [--device cpu|gpu] [--logits] \
-         [--cpu-heads N] [--tempo-weight W] [--hold P] [--chords FILE] [--precision f32|int16] AUDIO... | --weights FILE --save-int16 OUT"
+         [--cpu-heads N] [--tempo-weight W] [--hold P] [--no-refold] [--chords FILE] [--notation symbol|harte] [--precision f32|int16] AUDIO... | --weights FILE --save-int16 OUT"
     );
     std::process::exit(2)
 }
@@ -83,7 +83,13 @@ fn write_logits(path: &Path, frames: &Frames, duration: f64) -> Result<()> {
 }
 
 /// Tsumugi-Chords' `<song>.chords.json` and `.chords.lab` from the stereo waveform and the song's `keys.json`.
-fn chord_outputs(model: &Chords, wave: &[Vec<f32>; 2], keys: &serde_json::Value) -> Result<(serde_json::Value, String)> {
+/// `notation`: the .lab's labels, `symbol` (Am7/G) or `harte` (A:min7/b7).
+fn chord_outputs(
+    model: &Chords,
+    wave: &[Vec<f32>; 2],
+    keys: &serde_json::Value,
+    notation: &str,
+) -> Result<(serde_json::Value, String)> {
     let floats = |k: &str| -> Vec<f64> { keys[k].as_array().map(|a| a.iter().filter_map(|v| v.as_f64()).collect()).unwrap_or_default() };
     let segments = keys["keys"]
         .as_array()
@@ -95,11 +101,11 @@ fn chord_outputs(model: &Chords, wave: &[Vec<f32>; 2], keys: &serde_json::Value)
         .unwrap_or_default();
     let info = Info { beats: floats("beats"), downbeats: floats("downbeats"), keys: segments };
     let found = if info.beats.len() < 2 { Vec::new() } else { model.decoder.decode(&model.probabilities(wave, &info), &info) };
-    let lab: String = found.iter().map(|c| format!("{:.3}\t{:.3}\t{}\n", c.start, c.end, c.label)).collect();
-    let chords: Vec<serde_json::Value> = found
+    let lab: String = found
         .iter()
-        .map(|c| serde_json::json!({"start": c.start, "end": c.end, "label": c.label, "root": c.root, "quality": c.quality, "bass": c.bass}))
+        .map(|c| format!("{:.3}\t{:.3}\t{}\n", c.start, c.end, if notation == "harte" { &c.label } else { &c.symbol }))
         .collect();
+    let chords: Vec<serde_json::Value> = found.iter().map(|c| c.json()).collect();
     let json = serde_json::json!({"audio": keys["audio"], "duration": keys["duration"], "beats": keys["beats"],
                                   "downbeats": keys["downbeats"], "keys": keys["keys"], "chords": chords});
     Ok((json, lab))
@@ -110,6 +116,8 @@ fn main() -> Result<()> {
     let (mut weights, mut threads, mut out_dir) = (None, None, PathBuf::from("outputs/cpu"));
     let (mut heads, mut logits, mut tempo_weight, mut inputs) = ("beat,melody".to_string(), false, 4.0, Vec::new());
     let mut hold = 0.0f64; // the beat tracker's fermata holds (`beats --hold`)
+    let mut refold = true; // `beats --no-refold`
+    let mut notation = "symbol".to_string(); // the chords' .lab labels (`tsumugi-chords --notation`)
     let mut from_logits = false;
     let mut device = "cpu".to_string(); // inputs are `--logits` files: run the trackers only (for testing them)
     let mut adapter = None;
@@ -131,6 +139,8 @@ fn main() -> Result<()> {
             "--device" => device = args.next().unwrap_or_else(|| usage()),
             "--from-logits" => from_logits = true,
             "--cpu-heads" => cpu_heads = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--no-refold" => refold = false,
+            "--notation" => notation = args.next().filter(|v| v == "symbol" || v == "harte").unwrap_or_else(|| usage()),
             "--hold" => hold = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--tempo-weight" => tempo_weight = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
@@ -213,7 +223,7 @@ fn main() -> Result<()> {
         started.elapsed().as_secs_f64(),
         tsumugi_engine::simd::avx2()
     );
-    let tracker_options = tsumugi_engine::tracker::Options { p_hold: hold, ..Default::default() };
+    let tracker_options = tsumugi_engine::tracker::Options { p_hold: hold, refold, ..Default::default() };
     std::fs::create_dir_all(&out_dir)?;
     for input in &inputs {
         let watch = MemoryWatch::start();
@@ -265,13 +275,25 @@ fn main() -> Result<()> {
                 }
                 if let Some(keys) = &model.keys {
                     let mut r = result.clone();
-                    r["keys"] = bars::keys_json(keys, &inputs, &beats, &downbeats, duration);
+                    r["keys"] = bars::keys_json(keys, &inputs, &beats, &downbeats, duration, &serde_json::Value::Null);
                     if heads.contains(&"key") {
                         results.push(("keys", r.clone()));
                     }
                     if let (Some(model), Some(wave)) = (&chords, &stereo) {
                         let t = Instant::now();
-                        let (json, lab) = chord_outputs(model, wave, &r)?;
+                        // the keys as the chord model's SheetSage2-Refined revision decodes them
+                        let overrides = &model.key_decoding;
+                        let differs = overrides.as_object().is_some_and(|o| {
+                            o.iter().any(|(k, v)| {
+                                let own = keys.decoding.get(k).and_then(|v| v.as_f64());
+                                own.or((k == "min_bars").then_some(1.0)) != v.as_f64()
+                            })
+                        });
+                        let mut r = r.clone();
+                        if differs {
+                            r["keys"] = bars::keys_json(keys, &inputs, &beats, &downbeats, duration, overrides);
+                        }
+                        let (json, lab) = chord_outputs(model, wave, &r, &notation)?;
                         tsumugi_engine::profile::add("chords", t.elapsed().as_secs_f64());
                         let path = out_dir.join(format!("{stem}.chords.lab"));
                         std::fs::write(&path, lab)?;

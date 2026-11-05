@@ -13,7 +13,11 @@ engine would otherwise compute them per song:
 * the adapter's LayerNorm goes into its first linear layer;
 * of the outputs only the bass, root x quality and chord-boundary rows are kept (what the decoder reads);
 * the CQT's kernels, windows and resampling filter, the harmonic interpolation and the decoder's tables (length,
-  position, the key-relative bigram, the quality families, chord tones and labels) are stored as they are computed.
+  position, bass interval, the key-relative bigram, the quality families, chord tones and labels) are stored as they
+  are computed;
+* the key decoding of the SheetSage2-Refined revision the model reads its beats and keys from (``beats_keys``) is
+  stored with it, so the engine decodes the chord model's keys as Tsumugi-Chords does (``keys.json`` keeps the
+  decoding of the engine's own SheetSage2-Refined export).
 
 Weights are float32 (``--dtype f16`` stores the linear layers as float16, half the file).
 """
@@ -172,6 +176,18 @@ def export_decoder(out: Writer, folder_file, tracker: dict) -> dict:
             "sub_tolerance": semi_crf.SUB_TOLERANCE}  # fmt: skip
 
 
+def key_decoding(beats_keys: dict) -> dict:
+    """``key_tracker.decoding`` of the SheetSage2-Refined folder or repo (at its revision) in ``beats_keys``, with
+    ``min_bars`` written out (absent: 1, the bar Viterbi)."""
+
+    if not beats_keys.get("model"):
+        return {}
+    path = model_file(beats_keys["model"], "config.json", beats_keys.get("revision"))
+    decoding = dict((json.loads(path.read_text(encoding="utf-8")).get("key_tracker") or {}).get("decoding") or {})
+    decoding["min_bars"] = int(decoding.get("min_bars") or 1)
+    return decoding
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("out", type=Path)
@@ -187,9 +203,11 @@ def main() -> None:
     with torch.no_grad():
         meta = export_model(out, model)
     decoder = export_decoder(out, folder_file, tracker)
+    beats_keys = dict(config.get("beats_keys") or {})
+    beats_keys["key_decoding"] = key_decoding(beats_keys)
     metadata = {"format": FORMAT, "dtype": args.dtype, "model": str(args.model), "revision": str(args.revision),
                 "config": json.dumps(meta), "decoder": json.dumps(decoder),
-                "beats_keys": json.dumps(config.get("beats_keys") or {})}  # fmt: skip
+                "beats_keys": json.dumps(beats_keys)}  # fmt: skip
     args.out.parent.mkdir(parents=True, exist_ok=True)
     save_file(out.tensors, str(args.out), metadata=metadata)
     size = sum(v.nbytes for v in out.tensors.values())
